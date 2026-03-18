@@ -69,6 +69,9 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    binary_embed_width_mult = int(os.environ.get("BINARY_EMBED_WIDTH_MULT", 1))
+    binary_embed_layers = int(os.environ.get("BINARY_EMBED_LAYERS", 1))
+    binary_lm_head_norm = bool(int(os.environ.get("BINARY_LM_HEAD_NORM", "1")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -85,6 +88,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
+    compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -310,6 +315,31 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
+
+def find_binary_weight_bases(state_dict: dict[str, Tensor]) -> dict[str, str]:
+    bases: dict[str, str] = {}
+    for name, tensor in state_dict.items():
+        if not name.endswith(".threshold"):
+            continue
+        base = name.removesuffix(".threshold")
+        weight_name = f"{base}.weight"
+        if weight_name in state_dict and state_dict[weight_name].ndim == 2:
+            bases[weight_name] = name
+    return bases
+
+
+def pack_binary_tensor(sign_tensor: Tensor) -> Tensor:
+    bits = sign_tensor.to(dtype=torch.uint8).cpu().numpy()
+    packed = np.packbits(bits, axis=-1, bitorder="little")
+    return torch.from_numpy(packed.copy())
+
+
+def unpack_binary_tensor(packed: Tensor, shape: tuple[int, ...], dtype: torch.dtype) -> Tensor:
+    bits = np.unpackbits(packed.cpu().numpy(), axis=-1, bitorder="little")
+    bits = bits[..., : shape[-1]]
+    signs = bits.astype(np.float32) * 2.0 - 1.0
+    return torch.from_numpy(signs.reshape(shape)).to(dtype=dtype).contiguous()
+
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
@@ -350,17 +380,44 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     dtypes: dict[str, str] = {}
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
+    binary: dict[str, Tensor] = {}
+    binary_meta: dict[str, dict[str, object]] = {}
     qmeta: dict[str, dict[str, object]] = {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
         0,
     )
+    binary_thresholds = find_binary_weight_bases(state_dict)
+    consumed_names: set[str] = set()
 
     for name, tensor in state_dict.items():
+        if name in consumed_names:
+            continue
         t = tensor.detach().to("cpu").contiguous()
         stats["param_count"] += int(t.numel())
         stats["num_tensors"] += 1
         stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        threshold_name = binary_thresholds.get(name)
+        if threshold_name is not None:
+            threshold = state_dict[threshold_name].detach().to("cpu").contiguous()
+            stats["param_count"] += int(threshold.numel())
+            stats["num_tensors"] += 1
+            stats["baseline_tensor_bytes"] += tensor_nbytes(threshold)
+            sign_tensor = (t.float() - threshold.float()).ge(0)
+            packed = pack_binary_tensor(sign_tensor)
+            binary[name] = packed
+            binary_meta[name] = {
+                "shape": list(t.shape),
+                "dtype": str(t.dtype).removeprefix("torch."),
+                "threshold_name": threshold_name,
+                "threshold_shape": list(threshold.shape),
+                "threshold_dtype": str(threshold.dtype).removeprefix("torch."),
+            }
+            stats["num_float_tensors"] += 1
+            stats["int8_payload_bytes"] += tensor_nbytes(packed)
+            consumed_names.add(threshold_name)
+            continue
 
         if not t.is_floating_point():
             stats["num_nonfloat_tensors"] += 1
@@ -386,7 +443,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "mixed_binary_int8_clean_v1",
+        "binary": binary,
+        "binary_meta": binary_meta,
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -402,6 +461,15 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, packed in obj.get("binary", {}).items():
+        meta = obj["binary_meta"][name]
+        dtype = getattr(torch, meta["dtype"])
+        shape = tuple(int(v) for v in meta["shape"])
+        out[name] = unpack_binary_tensor(packed, shape, dtype)
+        threshold_name = meta["threshold_name"]
+        threshold_dtype = getattr(torch, meta["threshold_dtype"])
+        threshold_shape = tuple(int(v) for v in meta["threshold_shape"])
+        out[threshold_name] = torch.zeros(threshold_shape, dtype=threshold_dtype).contiguous()
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
@@ -507,10 +575,44 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # Retained for compatibility with the old baseline path and any untied float heads.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
+
+
+class BinarizeSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor) -> Tensor:
+        ctx.save_for_backward(x)
+        return torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> Tensor:
+        (x,) = ctx.saved_tensors
+        return grad_output * (1 - torch.tanh(x.clamp(-5, 5)).pow(2))
+
+
+class RoundSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor) -> Tensor:
+        return x.round()
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> Tensor:
+        return grad_output
+
+
+def binarize(x: Tensor) -> Tensor:
+    return BinarizeSTE.apply(x)
+
+
+def round_ste(x: Tensor) -> Tensor:
+    return RoundSTE.apply(x)
+
+
+def strict_sign(x: Tensor) -> Tensor:
+    return torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -519,6 +621,135 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+
+def binary_shift_scale(shift_param: Tensor, lo: int = -8, hi: int = 0) -> Tensor:
+    return 2 ** round_ste(shift_param.clamp(lo, hi))
+
+
+def binary_linear_weight(weight: Tensor, threshold: Tensor) -> Tensor:
+    return binarize(weight - threshold)
+
+
+class ShiftNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.scale_shift = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x - x.mean(dim=-1, keepdim=True)
+        mad = x.abs().mean(dim=-1, keepdim=True)
+        x = x / (2 ** torch.round(torch.log2(mad + self.eps)))
+        x = x * (2 ** round_ste(self.scale_shift))
+        return x * (round_ste(self.gamma * 128.0) / 128.0)
+
+
+class ShiftRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.scale_shift = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        rms = x.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
+        denom = 2 ** torch.round(torch.log2(rms.detach().clamp_min(self.eps)))
+        out = x / denom.to(dtype=x.dtype)
+        out = out * (2 ** round_ste(self.scale_shift.clamp(-4, 4)))
+        gain = round_ste(self.gamma * 128.0) / 128.0
+        return out * gain.to(dtype=x.dtype)
+
+
+class BinaryLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, init_std: float = 0.02):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * init_std)
+        self.threshold = nn.Parameter(torch.zeros(out_features, 1))
+        self.shift_param = nn.Parameter(torch.tensor(-4.5))
+
+    def forward(self, x: Tensor) -> Tensor:
+        x_bin = binarize(x)
+        w_bin = binary_linear_weight(self.weight, self.threshold).to(dtype=x.dtype)
+        out = F.linear(x_bin, w_bin)
+        return out * binary_shift_scale(self.shift_param)
+
+
+class BinaryWeightLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, init_std: float = 0.02):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features) * init_std)
+        self.threshold = nn.Parameter(torch.zeros(out_features, 1))
+        self.shift_param = nn.Parameter(torch.tensor(-4.0))
+
+    def forward(self, x: Tensor) -> Tensor:
+        w_bin = binary_linear_weight(self.weight, self.threshold).to(dtype=x.dtype)
+        out = F.linear(x, w_bin)
+        return out * binary_shift_scale(self.shift_param)
+
+
+class BinaryEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, hidden_size: int, width_mult: int = 1, extra_layers: int = 1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.inner_size = hidden_size * max(1, int(width_mult))
+        self.weight = nn.Parameter(torch.randn(vocab_size, self.inner_size) * 0.02)
+        self.threshold = nn.Parameter(torch.zeros(1, self.inner_size))
+        self.shift_param = nn.Parameter(torch.tensor(-5.0))
+        self.lookup_norm = ShiftNorm(self.inner_size)
+
+        if self.inner_size != hidden_size:
+            self.proj_norm = ShiftNorm(self.inner_size)
+            self.proj = BinaryWeightLinear(self.inner_size, hidden_size)
+            with torch.no_grad():
+                self.proj.shift_param.fill_(-5.0)
+        else:
+            self.proj_norm = None
+            self.proj = None
+
+        self.adapter_norms = nn.ModuleList()
+        self.adapter_layers = nn.ModuleList()
+        for _ in range(max(0, int(extra_layers))):
+            self.adapter_norms.append(ShiftNorm(hidden_size))
+            layer = BinaryWeightLinear(hidden_size, hidden_size)
+            with torch.no_grad():
+                layer.shift_param.fill_(-6.0)
+            self.adapter_layers.append(layer)
+
+    def binary_lookup_weight(self) -> Tensor:
+        return binarize(self.weight - self.threshold)
+
+    def project(self, hidden_states: Tensor) -> Tensor:
+        weight = self.binary_lookup_weight().to(dtype=hidden_states.dtype)
+        logits = F.linear(hidden_states, weight)
+        return logits * binary_shift_scale(self.shift_param)
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        weight = self.binary_lookup_weight()
+        hidden_states = F.embedding(input_ids, weight)
+        hidden_states = hidden_states * binary_shift_scale(self.shift_param)
+        hidden_states = self.lookup_norm(hidden_states)
+        if self.proj is not None:
+            hidden_states = self.proj(self.proj_norm(hidden_states))
+        for norm, layer in zip(self.adapter_norms, self.adapter_layers):
+            hidden_states = hidden_states + layer(norm(hidden_states))
+        return hidden_states
+
+
+class BinaryLMHead(nn.Module):
+    def __init__(self, hidden_size: int, vocab_size: int, use_norm: bool = True):
+        super().__init__()
+        self.use_norm = use_norm
+        self.norm = ShiftNorm(hidden_size) if use_norm else None
+        self.proj = BinaryWeightLinear(hidden_size, vocab_size)
+        with torch.no_grad():
+            self.proj.shift_param.fill_(-5.0)
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        if self.norm is not None:
+            hidden_states = self.norm(hidden_states)
+        return self.proj(hidden_states)
 
 
 class Rotary(nn.Module):
@@ -572,49 +803,59 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
+        self.norm = ShiftNorm(dim)
+        self.q_proj = BinaryLinear(dim, dim)
+        self.k_proj = BinaryLinear(dim, kv_dim)
+        self.v_proj = BinaryLinear(dim, kv_dim)
+        self.proj = BinaryWeightLinear(dim, dim)
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.margin = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        h = self.norm(x)
+        q = self.q_proj(h).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = binarize(q)
+        k = binarize(k)
+        v = binarize(v)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if self.num_kv_heads != self.num_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+        scores = q @ k.transpose(-2, -1)
+        scores = scores * (2 ** round_ste(self.margin.clamp(-4, 4)))
+        causal = torch.triu(torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(causal.view(1, 1, seqlen, seqlen), -65000.0)
+        scores_shifted = scores + self.head_dim
+        attn = F.relu(scores_shifted).pow(2)
+        denom = 2 ** round_ste(torch.log2(attn.sum(-1, keepdim=True) + 1e-6))
+        attn = attn / denom
+        y = attn @ v
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.norm = ShiftNorm(dim)
+        self.gate = BinaryLinear(dim, hidden)
+        self.up = BinaryLinear(dim, hidden)
+        self.mid_norm = ShiftNorm(hidden)
+        self.proj = BinaryWeightLinear(hidden, dim)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        h = self.norm(x)
+        h = self.gate(h) * self.up(h)
+        return self.proj(self.mid_norm(h))
 
 
 class Block(nn.Module):
@@ -628,8 +869,8 @@ class Block(nn.Module):
         qk_gain_init: float,
     ):
         super().__init__()
-        self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
+        self.attn_norm = ShiftRMSNorm(dim)
+        self.mlp_norm = ShiftRMSNorm(dim)
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -659,6 +900,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        binary_embed_width_mult: int,
+        binary_embed_layers: int,
+        binary_lm_head_norm: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,7 +910,12 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.tok_emb = BinaryEmbedding(
+            vocab_size,
+            model_dim,
+            width_mult=binary_embed_width_mult,
+            extra_layers=binary_embed_layers,
+        )
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -684,22 +933,15 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        self.final_norm = RMSNorm()
-        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-        if self.lm_head is not None:
-            self.lm_head._zero_init = True
+        self.final_norm = ShiftRMSNorm(model_dim)
+        self.lm_head = None if tie_embeddings else BinaryLMHead(model_dim, vocab_size, use_norm=binary_lm_head_norm)
         self._init_weights()
 
     def _init_weights(self) -> None:
-        if self.tie_embeddings:
-            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
@@ -715,7 +957,7 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = self.tok_emb.project(x)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -835,12 +1077,24 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        binary_embed_width_mult=args.binary_embed_width_mult,
+        binary_embed_layers=args.binary_embed_layers,
+        binary_lm_head_norm=args.binary_lm_head_norm,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compile_status = "disabled"
+    if args.use_compile:
+        try:
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=args.compile_fullgraph)
+            compile_status = f"enabled fullgraph={args.compile_fullgraph}"
+        except Exception as exc:
+            compiled_model = base_model
+            compile_status = f"fallback ({type(exc).__name__}: {exc})"
+    else:
+        compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -848,22 +1102,35 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    named_params = list(base_model.named_parameters())
+    token_weight_name = "tok_emb.weight"
+    head_matrix_names = {
+        name for name, p in named_params
+        if name.startswith("lm_head") and p.ndim == 2
+    }
+    excluded_matrix_names = {token_weight_name, *head_matrix_names}
     matrix_params = [
         p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        for name, p in named_params
+        if (
+            name not in excluded_matrix_names
+            and p.ndim == 2
+            and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        )
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        for name, p in named_params
+        if (
+            name not in excluded_matrix_names
+            and (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+        )
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    token_params = [p for name, p in named_params if name == token_weight_name]
+    head_params = [p for name, p in named_params if name in head_matrix_names]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": token_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -883,9 +1150,9 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.lm_head is not None:
+    if head_params:
         optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            [{"params": head_params, "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -895,11 +1162,12 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"compile:{compile_status}")
+    log0("attention_mode:binary_relu2_gqa")
+    log0(f"attention_heads:num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+        f"head_lr:{args.head_lr if head_params else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
