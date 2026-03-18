@@ -808,7 +808,9 @@ class CausalSelfAttention(nn.Module):
         self.k_proj = BinaryLinear(dim, kv_dim)
         self.v_proj = BinaryLinear(dim, kv_dim)
         self.proj = BinaryWeightLinear(dim, dim)
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        # Keep broadcasted control tensors in their runtime shape so torch.compile
+        # does not have to reason about unsqueezed parameter views in backward.
+        self.q_gain = nn.Parameter(torch.full((1, num_heads, 1, 1), qk_gain_init, dtype=torch.float32))
         self.margin = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
@@ -824,7 +826,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q = q * self.q_gain.to(dtype=q.dtype)
         if self.num_kv_heads != self.num_heads:
             repeats = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(repeats, dim=1)
@@ -873,16 +875,18 @@ class Block(nn.Module):
         self.mlp_norm = ShiftRMSNorm(dim)
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.attn_scale = nn.Parameter(torch.ones(1, 1, dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(1, 1, dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(
+            torch.stack((torch.ones(1, 1, dim), torch.zeros(1, 1, dim))).float()
+        )
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x = mix[0] * x + mix[1] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype) * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -919,7 +923,7 @@ class GPT(nn.Module):
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, 1, 1, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -951,7 +955,7 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = x + self.skip_weights[i].to(dtype=x.dtype) * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
