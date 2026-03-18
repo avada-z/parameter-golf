@@ -581,34 +581,17 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
-class BinarizeSTE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: Tensor) -> Tensor:
-        ctx.save_for_backward(x)
-        return torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tensor:
-        (x,) = ctx.saved_tensors
-        return grad_output * (1 - torch.tanh(x.clamp(-5, 5)).pow(2))
-
-
-class RoundSTE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: Tensor) -> Tensor:
-        return x.round()
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor) -> Tensor:
-        return grad_output
-
-
 def binarize(x: Tensor) -> Tensor:
-    return BinarizeSTE.apply(x)
+    hard = torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
+    # Detach-based STE keeps the forward hard-binary while exposing a plain
+    # compiled graph to Dynamo/Inductor instead of a custom autograd.Function.
+    surrogate = torch.tanh(x)
+    return hard.detach() + surrogate - surrogate.detach()
 
 
 def round_ste(x: Tensor) -> Tensor:
-    return RoundSTE.apply(x)
+    rounded = x.round()
+    return x + (rounded - x).detach()
 
 
 def strict_sign(x: Tensor) -> Tensor:
