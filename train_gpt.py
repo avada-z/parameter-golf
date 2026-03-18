@@ -598,6 +598,10 @@ def strict_sign(x: Tensor) -> Tensor:
     return torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
 
 
+def scale_last_dim(x: Tensor, scale: Tensor) -> Tensor:
+    return torch.einsum("...d,d->...d", x, scale.to(dtype=x.dtype))
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -626,7 +630,8 @@ class ShiftNorm(nn.Module):
         mad = x.abs().mean(dim=-1, keepdim=True)
         x = x / (2 ** torch.round(torch.log2(mad + self.eps)))
         x = x * (2 ** round_ste(self.scale_shift))
-        return x * (round_ste(self.gamma * 128.0) / 128.0)
+        gain = round_ste(self.gamma * 128.0) / 128.0
+        return scale_last_dim(x, gain)
 
 
 class ShiftRMSNorm(nn.Module):
@@ -642,7 +647,7 @@ class ShiftRMSNorm(nn.Module):
         out = x / denom.to(dtype=x.dtype)
         out = out * (2 ** round_ste(self.scale_shift.clamp(-4, 4)))
         gain = round_ste(self.gamma * 128.0) / 128.0
-        return out * gain.to(dtype=x.dtype)
+        return scale_last_dim(out, gain)
 
 
 class BinaryLinear(nn.Module):
@@ -791,9 +796,7 @@ class CausalSelfAttention(nn.Module):
         self.k_proj = BinaryLinear(dim, kv_dim)
         self.v_proj = BinaryLinear(dim, kv_dim)
         self.proj = BinaryWeightLinear(dim, dim)
-        # Keep broadcasted control tensors in their runtime shape so torch.compile
-        # does not have to reason about unsqueezed parameter views in backward.
-        self.q_gain = nn.Parameter(torch.full((1, num_heads, 1, 1), qk_gain_init, dtype=torch.float32))
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.margin = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
@@ -809,7 +812,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)
+        q = torch.einsum("bhtd,h->bhtd", q, self.q_gain.to(dtype=q.dtype))
         if self.num_kv_heads != self.num_heads:
             repeats = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(repeats, dim=1)
@@ -858,18 +861,16 @@ class Block(nn.Module):
         self.mlp_norm = ShiftRMSNorm(dim)
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(1, 1, dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(1, 1, dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(
-            torch.stack((torch.ones(1, 1, dim), torch.zeros(1, 1, dim))).float()
-        )
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_skip = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0] * x + mix[1] * x0
+        x = scale_last_dim(x, self.resid_scale) + scale_last_dim(x0, self.resid_skip)
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype) * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
+        x = x + scale_last_dim(attn_out, self.attn_scale)
+        x = x + scale_last_dim(self.mlp(self.mlp_norm(x)), self.mlp_scale)
         return x
 
 
@@ -906,7 +907,7 @@ class GPT(nn.Module):
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, 1, 1, model_dim, dtype=torch.float32))
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -938,7 +939,7 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype) * skips.pop()
+                x = x + scale_last_dim(skips.pop(), self.skip_weights[i])
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
