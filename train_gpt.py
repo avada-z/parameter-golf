@@ -48,6 +48,8 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_log_every = int(os.environ.get("VAL_LOG_EVERY", 10))
+    validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -251,6 +253,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    log_fn=None,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -266,13 +269,15 @@ def eval_val(
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
+    total_batches = max((seq_end - seq_start + local_batch_seqs - 1) // local_batch_seqs, 1)
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+        eval_t0 = time.perf_counter()
+        for batch_idx, batch_seq_start in enumerate(range(seq_start, seq_end, local_batch_seqs), start=1):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
             raw_end = batch_seq_end * args.train_seq_len + 1
@@ -289,6 +294,17 @@ def eval_val(
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
+            if (
+                log_fn is not None
+                and rank == 0
+                and args.val_log_every > 0
+                and (batch_idx == 1 or batch_idx % args.val_log_every == 0 or batch_idx == total_batches)
+            ):
+                elapsed_ms = 1000.0 * (time.perf_counter() - eval_t0)
+                log_fn(
+                    f"validating_progress:batches:{batch_idx}/{total_batches} "
+                    f"elapsed:{elapsed_ms:.0f}ms"
+                )
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -1194,6 +1210,10 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"log_cadence:train_every:{args.train_log_every} "
+        f"val_every:{args.val_loss_every} val_progress_every:{args.val_log_every}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1260,10 +1280,15 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = last_step or (
+            args.val_loss_every > 0
+            and step % args.val_loss_every == 0
+            and (step > 0 or args.validate_at_step_zero)
+        )
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            log0(f"validating:step:{step} val_tokens:{val_tokens.numel() - 1} val_batch_size:{args.val_batch_size}")
             val_loss, val_bpb = eval_val(
                 args,
                 model,
@@ -1275,6 +1300,7 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                log0,
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1397,6 +1423,7 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        log0,
     )
     torch.cuda.synchronize()
     log0(
