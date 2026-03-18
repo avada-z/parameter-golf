@@ -90,6 +90,8 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
     compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
+    compile_disable_mix_order_reduction = bool(int(os.environ.get("COMPILE_DISABLE_MIX_ORDER_REDUCTION", "1")))
+    compile_disable_epilogue_fusion = bool(int(os.environ.get("COMPILE_DISABLE_EPILOGUE_FUSION", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -112,6 +114,23 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
+
+
+def configure_inductor_for_binary_compile(args: Hyperparameters) -> list[str]:
+    tweaks: list[str] = []
+    if not args.use_compile:
+        return tweaks
+    try:
+        import torch._inductor.config as inductor_config
+    except Exception:
+        return tweaks
+    if args.compile_disable_mix_order_reduction and hasattr(inductor_config, "triton"):
+        inductor_config.triton.mix_order_reduction = False
+        tweaks.append("no_mix_order_reduction")
+    if args.compile_disable_epilogue_fusion and hasattr(inductor_config, "epilogue_fusion"):
+        inductor_config.epilogue_fusion = False
+        tweaks.append("no_epilogue_fusion")
+    return tweaks
 
 
 class Muon(torch.optim.Optimizer):
@@ -599,7 +618,16 @@ def strict_sign(x: Tensor) -> Tensor:
 
 
 def scale_last_dim(x: Tensor, scale: Tensor) -> Tensor:
-    return torch.einsum("...d,d->...d", x, scale.to(dtype=x.dtype))
+    x_flat = x.reshape(-1, x.size(-1))
+    y_flat = x_flat * scale.to(dtype=x.dtype)
+    return y_flat.view_as(x)
+
+
+def scale_head_axis(x: Tensor, scale: Tensor) -> Tensor:
+    bsz, nheads, seqlen, head_dim = x.shape
+    x_perm = x.permute(0, 2, 3, 1).reshape(-1, nheads)
+    y_perm = x_perm * scale.to(dtype=x.dtype)
+    return y_perm.view(bsz, seqlen, head_dim, nheads).permute(0, 3, 1, 2).contiguous()
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -812,7 +840,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = torch.einsum("bhtd,h->bhtd", q, self.q_gain.to(dtype=q.dtype))
+        q = scale_head_axis(q, self.q_gain)
         if self.num_kv_heads != self.num_heads:
             repeats = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(repeats, dim=1)
@@ -963,6 +991,7 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    compile_tweaks = configure_inductor_for_binary_compile(args)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1150,6 +1179,8 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    if compile_tweaks:
+        compile_status = f"{compile_status} tweaks={','.join(compile_tweaks)}"
     log0(f"compile:{compile_status}")
     log0("attention_mode:binary_relu2_gqa")
     log0(f"attention_heads:num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
