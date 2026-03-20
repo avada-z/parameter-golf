@@ -50,8 +50,11 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     linear_impl = os.environ.get("LINEAR_IMPL", "standard")
+    embed_impl = os.environ.get("EMBED_IMPL", "dense")
+    head_impl = os.environ.get("HEAD_IMPL", "dense")
     sine_k = int(os.environ.get("SINE_K", 16))
     sine_m = int(os.environ.get("SINE_M", 1))
+    attention_mode = os.environ.get("ATTENTION_MODE", "binary_relu2")
     attn_chunk_size = int(os.environ.get("ATTN_CHUNK_SIZE", 128))
     checkpoint_blocks = bool(int(os.environ.get("CHECKPOINT_BLOCKS", "0")))
 
@@ -601,18 +604,12 @@ def binarize(x: Tensor) -> Tensor:
 def round_ste(x: Tensor) -> Tensor:
     rounded = x.round()
     return x + (rounded - x).detach()
-
-
 def strict_sign(x: Tensor) -> Tensor:
     return torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
-
-
 def scale_last_dim(x: Tensor, scale: Tensor) -> Tensor:
     x_flat = x.reshape(-1, x.size(-1))
     y_flat = x_flat * scale.to(dtype=x.dtype)
     return y_flat.view_as(x)
-
-
 def scale_head_axis(x: Tensor, scale: Tensor) -> Tensor:
     bsz, nheads, seqlen, head_dim = x.shape
     x_perm = x.permute(0, 2, 3, 1).reshape(-1, nheads)
@@ -630,8 +627,6 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 def binary_shift_scale(shift_param: Tensor, lo: int = -8, hi: int = 0) -> Tensor:
     return 2 ** round_ste(shift_param.clamp(lo, hi))
-
-
 def binary_linear_weight(weight: Tensor, threshold: Tensor) -> Tensor:
     return binarize(weight - threshold)
 
@@ -686,8 +681,6 @@ def binary_linear_apply(x: Tensor, module: nn.Module, already_binarized: bool = 
 def binary_linear_group(x: Tensor, *modules: nn.Module) -> list[Tensor]:
     x_bin = binarize(x)
     return [binary_linear_apply(x_bin, module, already_binarized=True) for module in modules]
-
-
 class ShiftNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -774,11 +767,13 @@ class BinaryWeightLinear(nn.Module):
 class BinaryEmbedding(nn.Module):
     def __init__(self, vocab_size: int, hidden_size: int, width_mult: int = 1, extra_layers: int = 1):
         super().__init__()
+        self.impl = os.environ.get("EMBED_IMPL", "dense")
         self.hidden_size = hidden_size
         self.inner_size = hidden_size * max(1, int(width_mult))
         self.weight = nn.Parameter(torch.randn(vocab_size, self.inner_size) * 0.02)
-        self.threshold = nn.Parameter(torch.zeros(1, self.inner_size))
-        self.shift_param = nn.Parameter(torch.tensor(-5.0))
+        if self.impl == "binary":
+            self.threshold = nn.Parameter(torch.zeros(1, self.inner_size))
+            self.shift_param = nn.Parameter(torch.tensor(-5.0))
         self.lookup_norm = ShiftNorm(self.inner_size)
 
         if self.inner_size != hidden_size:
@@ -800,17 +795,20 @@ class BinaryEmbedding(nn.Module):
             self.adapter_layers.append(layer)
 
     def binary_lookup_weight(self) -> Tensor:
+        if self.impl != "binary":
+            return self.weight
         return binarize(self.weight - self.threshold)
 
     def project(self, hidden_states: Tensor) -> Tensor:
         weight = self.binary_lookup_weight().to(dtype=hidden_states.dtype)
         logits = F.linear(hidden_states, weight)
-        return logits * binary_shift_scale(self.shift_param)
+        return logits if self.impl != "binary" else logits * binary_shift_scale(self.shift_param)
 
     def forward(self, input_ids: Tensor) -> Tensor:
         weight = self.binary_lookup_weight()
         hidden_states = F.embedding(input_ids, weight)
-        hidden_states = hidden_states * binary_shift_scale(self.shift_param)
+        if self.impl == "binary":
+            hidden_states = hidden_states * binary_shift_scale(self.shift_param)
         hidden_states = self.lookup_norm(hidden_states)
         if self.proj is not None:
             hidden_states = self.proj(self.proj_norm(hidden_states))
@@ -822,18 +820,18 @@ class BinaryEmbedding(nn.Module):
 class BinaryLMHead(nn.Module):
     def __init__(self, hidden_size: int, vocab_size: int, use_norm: bool = True):
         super().__init__()
+        self.impl = os.environ.get("HEAD_IMPL", "dense")
         self.use_norm = use_norm
         self.norm = ShiftNorm(hidden_size) if use_norm else None
-        self.proj = BinaryWeightLinear(hidden_size, vocab_size)
-        with torch.no_grad():
-            self.proj.shift_param.fill_(-5.0)
+        self.proj = CastedLinear(hidden_size, vocab_size, bias=False) if self.impl != "binary" else BinaryWeightLinear(hidden_size, vocab_size)
+        if self.impl == "binary":
+            with torch.no_grad():
+                self.proj.shift_param.fill_(-5.0)
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
         return self.proj(hidden_states)
-
-
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -891,6 +889,7 @@ class CausalSelfAttention(nn.Module):
         self.v_proj = BinaryLinear(dim, kv_dim)
         self.proj = BinaryWeightLinear(dim, dim)
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.mode = os.environ.get("ATTENTION_MODE", "binary_relu2")
         self.margin = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
         self.attn_chunk_size = max(0, int(os.environ.get("ATTN_CHUNK_SIZE", 128)))
@@ -899,30 +898,32 @@ class CausalSelfAttention(nn.Module):
         bsz, seqlen, dim = x.shape
         h = self.norm(x)
         q, k, v = [t.reshape(bsz, seqlen, nh, self.head_dim).transpose(1, 2) for t, nh in zip(binary_linear_group(h, self.q_proj, self.k_proj, self.v_proj), (self.num_heads, self.num_kv_heads, self.num_kv_heads), strict=True)]
-        q = binarize(q)
-        k = binarize(k)
-        v = binarize(v)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-        q = scale_head_axis(q, self.q_gain)
-        if self.num_kv_heads != self.num_heads:
-            repeats = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeats, dim=1)
-            v = v.repeat_interleave(repeats, dim=1)
-        margin = 2 ** round_ste(self.margin.clamp(-4, 4))
-        chunk = self.attn_chunk_size if 0 < self.attn_chunk_size < seqlen else seqlen
-        q_pos = torch.arange(seqlen, device=x.device).view(1, 1, seqlen, 1)
-        attn_sum = q.new_zeros((bsz, self.num_heads, seqlen, 1))
-        y = q.new_zeros((bsz, self.num_heads, seqlen, self.head_dim))
-        for start in range(0, seqlen, chunk):
-            end = min(start + chunk, seqlen)
-            scores = (q @ k[:, :, start:end, :].transpose(-2, -1)) * margin
-            scores = scores.masked_fill(torch.arange(start, end, device=x.device).view(1, 1, 1, -1) > q_pos, -65000.0)
-            attn_chunk = F.relu(scores + self.head_dim).pow(2)
-            attn_sum = attn_sum + attn_chunk.sum(-1, keepdim=True)
-            y = y + attn_chunk @ v[:, :, start:end, :]
-        y = y / (2 ** round_ste(torch.log2(attn_sum + 1e-6)))
+        if self.mode == "flash":
+            q = scale_head_axis(apply_rotary_emb(F.rms_norm(q, (q.size(-1),)), cos, sin), self.q_gain)
+            k = apply_rotary_emb(F.rms_norm(k, (k.size(-1),)), cos, sin)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads))
+        else:
+            q = scale_head_axis(apply_rotary_emb(binarize(q), cos, sin), self.q_gain)
+            k = apply_rotary_emb(binarize(k), cos, sin)
+            v = binarize(v)
+            if self.num_kv_heads != self.num_heads:
+                repeats = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeats, dim=1)
+                v = v.repeat_interleave(repeats, dim=1)
+            margin = 2 ** round_ste(self.margin.clamp(-4, 4))
+            chunk = self.attn_chunk_size if 0 < self.attn_chunk_size < seqlen else seqlen
+            q_pos = torch.arange(seqlen, device=x.device).view(1, 1, seqlen, 1)
+            attn_sum = q.new_zeros((bsz, self.num_heads, seqlen, 1))
+            y = q.new_zeros((bsz, self.num_heads, seqlen, self.head_dim))
+            for start in range(0, seqlen, chunk):
+                end = min(start + chunk, seqlen)
+                scores = (q @ k[:, :, start:end, :].transpose(-2, -1)) * margin
+                scores = scores.masked_fill(torch.arange(start, end, device=x.device).view(1, 1, 1, -1) > q_pos, -65000.0)
+                attn_chunk = F.relu(scores + self.head_dim).pow(2)
+                attn_sum = attn_sum + attn_chunk.sum(-1, keepdim=True)
+                y = y + attn_chunk @ v[:, :, start:end, :]
+            y = y / (2 ** round_ste(torch.log2(attn_sum + 1e-6)))
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -1246,8 +1247,9 @@ def main() -> None:
     if compile_tweaks:
         compile_status = f"{compile_status} tweaks={','.join(compile_tweaks)}"
     log0(f"compile:{compile_status}")
-    log0("attention_mode:binary_relu2_gqa")
+    log0(f"attention_mode:{args.attention_mode}_gqa")
     log0(f"linear_impl:{args.linear_impl} sine_k:{args.sine_k} sine_m:{args.sine_m}")
+    log0(f"embed_impl:{args.embed_impl} head_impl:{args.head_impl}")
     log0(f"attn_chunk_size:{args.attn_chunk_size} checkpoint_blocks:{args.checkpoint_blocks}")
     log0(f"attention_heads:num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
