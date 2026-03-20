@@ -903,6 +903,7 @@ class CausalSelfAttention(nn.Module):
             q = scale_head_axis(apply_rotary_emb(F.rms_norm(q, (q.size(-1),)), cos, sin), self.q_gain)
             k = apply_rotary_emb(F.rms_norm(k, (k.size(-1),)), cos, sin)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, enable_gqa=(self.num_kv_heads != self.num_heads))
+            y = y + self.margin.to(dtype=y.dtype) * 0.0
         else:
             q = scale_head_axis(apply_rotary_emb(binarize(q), cos, sin), self.q_gain)
             k = apply_rotary_emb(binarize(k), cos, sin)
