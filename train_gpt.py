@@ -1,8 +1,4 @@
-"""
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
-
-Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
-"""
+"""Starter training script; keep under 1500 lines."""
 
 from __future__ import annotations
 
@@ -30,12 +26,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
-
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -61,6 +51,9 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    linear_impl = os.environ.get("LINEAR_IMPL", "standard")
+    sine_k = int(os.environ.get("SINE_K", 16))
+    sine_m = int(os.environ.get("SINE_M", 1))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -611,7 +604,6 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # Retained for compatibility with the old baseline path and any untied float heads.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
@@ -619,8 +611,6 @@ class CastedLinear(nn.Linear):
 
 def binarize(x: Tensor) -> Tensor:
     hard = torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
-    # Detach-based STE keeps the forward hard-binary while exposing a plain
-    # compiled graph to Dynamo/Inductor instead of a custom autograd.Function.
     surrogate = torch.tanh(x)
     return hard.detach() + surrogate - surrogate.detach()
 
@@ -663,6 +653,41 @@ def binary_linear_weight(weight: Tensor, threshold: Tensor) -> Tensor:
     return binarize(weight - threshold)
 
 
+def make_sine_bank(m: int, k: int, seed: int) -> tuple[Tensor, Tensor, Tensor]:
+    g = torch.Generator(device="cpu")
+    g.manual_seed(seed + 31 * m + k)
+    freq = (torch.rand(m, k, generator=g) * (2 * math.pi * math.log2(max(2, k))) + 1.0) / math.sqrt(max(1, m))
+    phase = torch.rand(k, generator=g) * (2 * math.pi)
+    r = min(k, 8)
+    sketch = (torch.randint(0, 2, (k, r), generator=g).float() * 2 - 1) / math.sqrt(max(1, k))
+    return freq, phase, sketch
+
+
+class SineLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, latent: Tensor, freq: Tensor, phase: Tensor, sketch: Tensor, m: int, k: int) -> Tensor:
+        lat = latent.view(latent.shape[0], latent.shape[1] // m, m)
+        ang = torch.einsum("obm,mk->obk", lat, freq) + phase.view(1, 1, -1)
+        w_full = strict_sign(torch.sin(ang)).reshape(latent.shape[0], -1)
+        x_flat = x.reshape(-1, lat.shape[1], k)
+        ctx.save_for_backward(torch.einsum("nik,kr->nir", x_flat, sketch.to(dtype=x.dtype)), w_full, latent, freq, phase, sketch)
+        ctx.m = m
+        ctx.xshape = x.shape
+        return F.linear(x, w_full.to(dtype=x.dtype))
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        x_sketch, w_full, latent, freq, phase, sketch = ctx.saved_tensors
+        grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
+        grad_input = grad_flat.matmul(w_full.to(dtype=grad_flat.dtype)).view(ctx.xshape)
+        grad_sketch = torch.einsum("no,nir->oir", grad_flat.float(), x_sketch.float())
+        grad_weight = torch.einsum("oir,kr->oik", grad_sketch, sketch.float()) / float(sketch.shape[-1])
+        lat = latent.view(latent.shape[0], latent.shape[1] // ctx.m, ctx.m).float()
+        ang = torch.einsum("obm,mk->obk", lat, freq.float()) + phase.float().view(1, 1, -1)
+        grad_latent = torch.einsum("obk,mk->obm", grad_weight * torch.cos(ang), freq.float()).reshape_as(latent)
+        return grad_input, grad_latent, None, None, None, None, None
+
+
 class ShiftNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -698,27 +723,57 @@ class ShiftRMSNorm(nn.Module):
 class BinaryLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, init_std: float = 0.02):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * init_std)
-        self.threshold = nn.Parameter(torch.zeros(out_features, 1))
+        self.impl = os.environ.get("LINEAR_IMPL", "standard")
         self.shift_param = nn.Parameter(torch.tensor(-4.5))
+        if self.impl == "sine":
+            self.k = int(os.environ.get("SINE_K", 16))
+            self.m = int(os.environ.get("SINE_M", 1))
+            if in_features % self.k != 0:
+                raise ValueError(f"sine linear requires in_features={in_features} divisible by k={self.k}")
+            self.latent = nn.Parameter(torch.randn(out_features, (in_features // self.k) * self.m) * (0.5 / math.sqrt(max(1, self.m))))
+            freq, phase, sketch = make_sine_bank(self.m, self.k, seed=9999 + in_features + out_features)
+            self.register_buffer("freq", freq, persistent=False)
+            self.register_buffer("phase", phase, persistent=False)
+            self.register_buffer("sketch", sketch, persistent=False)
+        else:
+            self.weight = nn.Parameter(torch.randn(out_features, in_features) * init_std)
+            self.threshold = nn.Parameter(torch.zeros(out_features, 1))
 
     def forward(self, x: Tensor) -> Tensor:
-        x_bin = binarize(x)
-        w_bin = binary_linear_weight(self.weight, self.threshold).to(dtype=x.dtype)
-        out = F.linear(x_bin, w_bin)
+        if self.impl == "sine":
+            out = SineLinearFunction.apply(binarize(x), self.latent, self.freq, self.phase, self.sketch, self.m, self.k)
+        else:
+            x_bin = binarize(x)
+            w_bin = binary_linear_weight(self.weight, self.threshold).to(dtype=x.dtype)
+            out = F.linear(x_bin, w_bin)
         return out * binary_shift_scale(self.shift_param)
 
 
 class BinaryWeightLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, init_std: float = 0.02):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * init_std)
-        self.threshold = nn.Parameter(torch.zeros(out_features, 1))
+        self.impl = os.environ.get("LINEAR_IMPL", "standard")
+        if self.impl == "sine":
+            self.k = int(os.environ.get("SINE_K", 16))
+            self.m = int(os.environ.get("SINE_M", 1))
+            if in_features % self.k != 0:
+                raise ValueError(f"sine linear requires in_features={in_features} divisible by k={self.k}")
+            self.latent = nn.Parameter(torch.randn(out_features, (in_features // self.k) * self.m) * (0.5 / math.sqrt(max(1, self.m))))
+            freq, phase, sketch = make_sine_bank(self.m, self.k, seed=19999 + in_features + out_features)
+            self.register_buffer("freq", freq, persistent=False)
+            self.register_buffer("phase", phase, persistent=False)
+            self.register_buffer("sketch", sketch, persistent=False)
+        else:
+            self.weight = nn.Parameter(torch.randn(out_features, in_features) * init_std)
+            self.threshold = nn.Parameter(torch.zeros(out_features, 1))
         self.shift_param = nn.Parameter(torch.tensor(-4.0))
 
     def forward(self, x: Tensor) -> Tensor:
-        w_bin = binary_linear_weight(self.weight, self.threshold).to(dtype=x.dtype)
-        out = F.linear(x, w_bin)
+        if self.impl == "sine":
+            out = SineLinearFunction.apply(x, self.latent, self.freq, self.phase, self.sketch, self.m, self.k)
+        else:
+            w_bin = binary_linear_weight(self.weight, self.threshold).to(dtype=x.dtype)
+            out = F.linear(x, w_bin)
         return out * binary_shift_scale(self.shift_param)
 
 
@@ -1200,6 +1255,7 @@ def main() -> None:
         compile_status = f"{compile_status} tweaks={','.join(compile_tweaks)}"
     log0(f"compile:{compile_status}")
     log0("attention_mode:binary_relu2_gqa")
+    log0(f"linear_impl:{args.linear_impl} sine_k:{args.sine_k} sine_m:{args.sine_m}")
     log0(f"attention_heads:num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
