@@ -22,10 +22,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.checkpoint import checkpoint
 
-# -----------------------------
-# HYPERPARAMETERS
-# -----------------------------
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -54,6 +52,8 @@ class Hyperparameters:
     linear_impl = os.environ.get("LINEAR_IMPL", "standard")
     sine_k = int(os.environ.get("SINE_K", 16))
     sine_m = int(os.environ.get("SINE_M", 1))
+    attn_chunk_size = int(os.environ.get("ATTN_CHUNK_SIZE", 128))
+    checkpoint_blocks = bool(int(os.environ.get("CHECKPOINT_BLOCKS", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -88,13 +88,6 @@ class Hyperparameters:
     compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
     compile_disable_mix_order_reduction = bool(int(os.environ.get("COMPILE_DISABLE_MIX_ORDER_REDUCTION", "1")))
     compile_disable_epilogue_fusion = bool(int(os.environ.get("COMPILE_DISABLE_EPILOGUE_FUSION", "0")))
-
-# -----------------------------
-# MUON OPTIMIZER 
-# -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
@@ -519,10 +512,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-# -----------------------------
-# DATA LOADING 
-# -----------------------------
-
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
@@ -541,8 +530,6 @@ def load_data_shard(file: Path) -> Tensor:
 
 
 class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
@@ -589,10 +576,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-# -----------------------------
-# TRANSFORMER MODULES
-# -----------------------------
 
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
@@ -670,22 +653,39 @@ class SineLinearFunction(torch.autograd.Function):
         ang = torch.einsum("obm,mk->obk", lat, freq) + phase.view(1, 1, -1)
         w_full = strict_sign(torch.sin(ang)).reshape(latent.shape[0], -1)
         x_flat = x.reshape(-1, lat.shape[1], k)
-        ctx.save_for_backward(torch.einsum("nik,kr->nir", x_flat, sketch.to(dtype=x.dtype)), w_full, latent, freq, phase, sketch)
+        ctx.save_for_backward(torch.einsum("nik,kr->nir", x_flat, sketch.to(dtype=x.dtype)), latent, freq, phase, sketch)
         ctx.m = m
+        ctx.k = k
         ctx.xshape = x.shape
         return F.linear(x, w_full.to(dtype=x.dtype))
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        x_sketch, w_full, latent, freq, phase, sketch = ctx.saved_tensors
+        x_sketch, latent, freq, phase, sketch = ctx.saved_tensors
         grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
+        lat = latent.view(latent.shape[0], latent.shape[1] // ctx.m, ctx.m).float()
+        ang = torch.einsum("obm,mk->obk", lat, freq.float()) + phase.float().view(1, 1, -1)
+        w_full = strict_sign(torch.sin(ang)).reshape(latent.shape[0], -1)
         grad_input = grad_flat.matmul(w_full.to(dtype=grad_flat.dtype)).view(ctx.xshape)
         grad_sketch = torch.einsum("no,nir->oir", grad_flat.float(), x_sketch.float())
         grad_weight = torch.einsum("oir,kr->oik", grad_sketch, sketch.float()) / float(sketch.shape[-1])
-        lat = latent.view(latent.shape[0], latent.shape[1] // ctx.m, ctx.m).float()
-        ang = torch.einsum("obm,mk->obk", lat, freq.float()) + phase.float().view(1, 1, -1)
         grad_latent = torch.einsum("obk,mk->obm", grad_weight * torch.cos(ang), freq.float()).reshape_as(latent)
         return grad_input, grad_latent, None, None, None, None, None
+
+
+def binary_linear_apply(x: Tensor, module: nn.Module, already_binarized: bool = False) -> Tensor:
+    if module.impl == "sine":
+        x_in = x if already_binarized else binarize(x)
+        out = SineLinearFunction.apply(x_in, module.latent, module.freq, module.phase, module.sketch, module.m, module.k)
+    else:
+        x_in = x if already_binarized else binarize(x)
+        out = F.linear(x_in, binary_linear_weight(module.weight, module.threshold).to(dtype=x.dtype))
+    return out * binary_shift_scale(module.shift_param)
+
+
+def binary_linear_group(x: Tensor, *modules: nn.Module) -> list[Tensor]:
+    x_bin = binarize(x)
+    return [binary_linear_apply(x_bin, module, already_binarized=True) for module in modules]
 
 
 class ShiftNorm(nn.Module):
@@ -740,13 +740,7 @@ class BinaryLinear(nn.Module):
             self.threshold = nn.Parameter(torch.zeros(out_features, 1))
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.impl == "sine":
-            out = SineLinearFunction.apply(binarize(x), self.latent, self.freq, self.phase, self.sketch, self.m, self.k)
-        else:
-            x_bin = binarize(x)
-            w_bin = binary_linear_weight(self.weight, self.threshold).to(dtype=x.dtype)
-            out = F.linear(x_bin, w_bin)
-        return out * binary_shift_scale(self.shift_param)
+        return binary_linear_apply(x, self)
 
 
 class BinaryWeightLinear(nn.Module):
@@ -899,13 +893,12 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.margin = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.attn_chunk_size = max(0, int(os.environ.get("ATTN_CHUNK_SIZE", 128)))
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         h = self.norm(x)
-        q = self.q_proj(h).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(h).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(h).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q, k, v = [t.reshape(bsz, seqlen, nh, self.head_dim).transpose(1, 2) for t, nh in zip(binary_linear_group(h, self.q_proj, self.k_proj, self.v_proj), (self.num_heads, self.num_kv_heads, self.num_kv_heads), strict=True)]
         q = binarize(q)
         k = binarize(k)
         v = binarize(v)
@@ -917,15 +910,19 @@ class CausalSelfAttention(nn.Module):
             repeats = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(repeats, dim=1)
             v = v.repeat_interleave(repeats, dim=1)
-        scores = q @ k.transpose(-2, -1)
-        scores = scores * (2 ** round_ste(self.margin.clamp(-4, 4)))
-        causal = torch.triu(torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(causal.view(1, 1, seqlen, seqlen), -65000.0)
-        scores_shifted = scores + self.head_dim
-        attn = F.relu(scores_shifted).pow(2)
-        denom = 2 ** round_ste(torch.log2(attn.sum(-1, keepdim=True) + 1e-6))
-        attn = attn / denom
-        y = attn @ v
+        margin = 2 ** round_ste(self.margin.clamp(-4, 4))
+        chunk = self.attn_chunk_size if 0 < self.attn_chunk_size < seqlen else seqlen
+        q_pos = torch.arange(seqlen, device=x.device).view(1, 1, seqlen, 1)
+        attn_sum = q.new_zeros((bsz, self.num_heads, seqlen, 1))
+        y = q.new_zeros((bsz, self.num_heads, seqlen, self.head_dim))
+        for start in range(0, seqlen, chunk):
+            end = min(start + chunk, seqlen)
+            scores = (q @ k[:, :, start:end, :].transpose(-2, -1)) * margin
+            scores = scores.masked_fill(torch.arange(start, end, device=x.device).view(1, 1, 1, -1) > q_pos, -65000.0)
+            attn_chunk = F.relu(scores + self.head_dim).pow(2)
+            attn_sum = attn_sum + attn_chunk.sum(-1, keepdim=True)
+            y = y + attn_chunk @ v[:, :, start:end, :]
+        y = y / (2 ** round_ste(torch.log2(attn_sum + 1e-6)))
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -942,7 +939,8 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         h = self.norm(x)
-        h = self.gate(h) * self.up(h)
+        gate, up = binary_linear_group(h, self.gate, self.up)
+        h = gate * up
         return self.proj(self.mid_norm(h))
 
 
@@ -998,6 +996,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.checkpoint_blocks = bool(int(os.environ.get("CHECKPOINT_BLOCKS", "0")))
         self.tok_emb = BinaryEmbedding(
             vocab_size,
             model_dim,
@@ -1032,15 +1031,16 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x0 = x
         skips: list[Tensor] = []
+        run_block = (lambda block, a, b: checkpoint(lambda aa, bb: block(aa, bb), a, b, use_reentrant=False)) if self.checkpoint_blocks and self.training else (lambda block, a, b: block(a, b))
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = run_block(self.blocks[i], x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + scale_last_dim(skips.pop(), self.skip_weights[i])
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = run_block(self.blocks[self.num_encoder_layers + i], x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1054,10 +1054,6 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
-# -----------------------------
-# TRAINING
-# -----------------------------
-
 def main() -> None:
     global zeropower_via_newtonschulz5
 
@@ -1065,10 +1061,6 @@ def main() -> None:
     args = Hyperparameters()
     compile_tweaks = configure_inductor_for_binary_compile(args)
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-
-    # -----------------------------
-    # DISTRIBUTED + CUDA SETUP
-    # -----------------------------
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1256,6 +1248,7 @@ def main() -> None:
     log0(f"compile:{compile_status}")
     log0("attention_mode:binary_relu2_gqa")
     log0(f"linear_impl:{args.linear_impl} sine_k:{args.sine_k} sine_m:{args.sine_m}")
+    log0(f"attn_chunk_size:{args.attn_chunk_size} checkpoint_blocks:{args.checkpoint_blocks}")
     log0(f"attention_heads:num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
