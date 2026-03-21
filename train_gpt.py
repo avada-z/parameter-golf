@@ -60,6 +60,9 @@ class Hyperparameters:
     size_gate_init = float(os.environ.get("SIZE_GATE_INIT", -6.0))
     size_bytes_per_param = float(os.environ.get("SIZE_BYTES_PER_PARAM", 1.0))
     size_export_threshold = float(os.environ.get("SIZE_EXPORT_THRESHOLD", 0.5))
+    shadow_group_size = int(os.environ.get("SHADOW_GROUP_SIZE", 0))
+    shadow_loss_weight = float(os.environ.get("SHADOW_LOSS_WEIGHT", 0.0))
+    shadow_bytes_per_param = float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0))
     attn_chunk_size = int(os.environ.get("ATTN_CHUNK_SIZE", 128))
     checkpoint_blocks = bool(int(os.environ.get("CHECKPOINT_BLOCKS", "0")))
 
@@ -219,6 +222,7 @@ class SizeGatedAdapter(nn.Module):
         self.down = nn.Parameter(torch.randn(rank, in_features) * (1.0 / max(1, in_features) ** 0.5))
         self.up = nn.Parameter(torch.zeros(out_features, rank))
         self.gate_logits = nn.Parameter(torch.full((rank,), gate_init))
+        self.compact_param_names = ("down", "up")
 
     def gate_probs(self) -> Tensor: return torch.sigmoid(self.gate_logits)
     def forward(self, x: Tensor) -> Tensor:
@@ -226,6 +230,92 @@ class SizeGatedAdapter(nn.Module):
         return F.linear(F.linear(x, self.down.to(dtype=x.dtype)) * z, self.up.to(dtype=x.dtype))
     def expected_size_bytes(self) -> Tensor:
         return self.gate_probs().sum() * (self.in_features + self.out_features) * self.bytes_per_param
+    def export_state(self, threshold: float) -> dict[str, Tensor]:
+        keep = (self.gate_probs() >= threshold).nonzero(as_tuple=False).flatten()
+        return {
+            "active_idx": keep.to(dtype=torch.int32),
+            "active_down": self.down.detach().index_select(0, keep),
+            "active_up": self.up.detach().index_select(1, keep),
+        }
+    def load_export_state(self, state: dict[str, Tensor]) -> dict[str, Tensor]:
+        idx = state["active_idx"].to(dtype=torch.long)
+        down, up = torch.zeros_like(self.down), torch.zeros_like(self.up)
+        if idx.numel() > 0:
+            down.index_copy_(0, idx, state["active_down"].to(dtype=down.dtype))
+            up.index_copy_(1, idx, state["active_up"].to(dtype=up.dtype))
+        return {"down": down, "up": up}
+
+
+class SizeGatedEmbeddingAdapter(nn.Module):
+    def __init__(self, vocab_size: int, hidden_size: int, rank: int, gate_init: float, bytes_per_param: float):
+        super().__init__()
+        self.vocab_size, self.hidden_size, self.bytes_per_param = vocab_size, hidden_size, bytes_per_param
+        self.left = nn.Parameter(torch.randn(vocab_size, rank) * (1.0 / max(1, rank) ** 0.5))
+        self.right = nn.Parameter(torch.zeros(rank, hidden_size))
+        self.gate_logits = nn.Parameter(torch.full((rank,), gate_init))
+        self.compact_param_names = ("left", "right")
+
+    def gate_probs(self) -> Tensor: return torch.sigmoid(self.gate_logits)
+    def expected_size_bytes(self) -> Tensor:
+        return self.gate_probs().sum() * (self.vocab_size + self.hidden_size) * self.bytes_per_param
+    def lookup(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        z = self.gate_probs().to(dtype=dtype)
+        mid = F.embedding(input_ids, self.left.to(dtype=dtype)) * z
+        return mid @ self.right.to(dtype=dtype)
+    def project(self, hidden_states: Tensor) -> Tensor:
+        z = self.gate_probs().to(dtype=hidden_states.dtype)
+        mid = F.linear(hidden_states, self.right.to(dtype=hidden_states.dtype)) * z
+        return F.linear(mid, self.left.to(dtype=hidden_states.dtype))
+    def export_state(self, threshold: float) -> dict[str, Tensor]:
+        keep = (self.gate_probs() >= threshold).nonzero(as_tuple=False).flatten()
+        return {
+            "active_idx": keep.to(dtype=torch.int32),
+            "active_left": self.left.detach().index_select(1, keep),
+            "active_right": self.right.detach().index_select(0, keep),
+        }
+    def load_export_state(self, state: dict[str, Tensor]) -> dict[str, Tensor]:
+        idx = state["active_idx"].to(dtype=torch.long)
+        left, right = torch.zeros_like(self.left), torch.zeros_like(self.right)
+        if idx.numel() > 0:
+            left.index_copy_(1, idx, state["active_left"].to(dtype=left.dtype))
+            right.index_copy_(0, idx, state["active_right"].to(dtype=right.dtype))
+        return {"left": left, "right": right}
+
+
+class ShadowGroupCompressor(nn.Module):
+    def __init__(self, shape: tuple[int, ...], group_size: int, bytes_per_param: float):
+        super().__init__()
+        self.shape = tuple(int(v) for v in shape)
+        self.numel = math.prod(self.shape)
+        self.group_size = max(1, int(group_size))
+        self.num_groups = (self.numel + self.group_size - 1) // self.group_size
+        self.bytes_per_param = bytes_per_param
+        self.latent = nn.Parameter(torch.zeros(self.num_groups))
+        self.basis = nn.Parameter(torch.zeros(3, self.group_size))
+        self.compact_param_names = ("latent", "basis")
+        with torch.no_grad():
+            self.basis[0].fill_(1.0)
+
+    def reconstruct(self, dtype: torch.dtype) -> Tensor:
+        z = self.latent.float()
+        feat = torch.stack((z, torch.tanh(z), torch.ones_like(z)), dim=1)
+        flat = (feat @ self.basis.float()).reshape(-1)[: self.numel]
+        return flat.view(self.shape).to(dtype=dtype)
+
+    def expected_size_bytes(self) -> Tensor:
+        return torch.tensor(self.num_groups + self.basis.numel(), device=self.latent.device, dtype=torch.float32) * self.bytes_per_param
+
+    @torch.no_grad()
+    def init_from_weight(self, weight: Tensor) -> None:
+        flat = weight.detach().float().reshape(-1)
+        if flat.numel() < self.num_groups * self.group_size:
+            flat = F.pad(flat, (0, self.num_groups * self.group_size - flat.numel()))
+        groups = flat.view(self.num_groups, self.group_size)
+        z = groups.mean(dim=1)
+        feat = torch.stack((z, torch.tanh(z), torch.ones_like(z)), dim=1)
+        sol = torch.linalg.lstsq(feat, groups).solution
+        self.latent.copy_(z.to(dtype=self.latent.dtype))
+        self.basis.copy_(sol.to(dtype=self.basis.dtype))
 
 
 def module_expected_size_bytes(module: nn.Module) -> Tensor:
@@ -235,6 +325,10 @@ def module_expected_size_bytes(module: nn.Module) -> Tensor:
         adapter = getattr(submodule, "size_adapter", None)
         if adapter is not None:
             val = adapter.expected_size_bytes()
+            total = val if total is None else total + val
+        shadow = getattr(submodule, "shadow", None)
+        if shadow is not None:
+            val = shadow.expected_size_bytes()
             total = val if total is None else total + val
     return total if total is not None else torch.zeros((), device=param.device if param is not None else "cpu")
 
@@ -246,11 +340,17 @@ def export_state_dict_with_size_gates(module: nn.Module, threshold: float) -> di
         if adapter is None:
             continue
         prefix = f"{name}.size_adapter." if name else "size_adapter."
-        keep = (adapter.gate_probs() >= threshold).nonzero(as_tuple=False).flatten()
-        state.pop(prefix + "down", None); state.pop(prefix + "up", None)
-        state[prefix + "active_idx"] = keep.to(dtype=torch.int32)
-        state[prefix + "active_down"] = adapter.down.detach().index_select(0, keep)
-        state[prefix + "active_up"] = adapter.up.detach().index_select(1, keep)
+        for pname in adapter.compact_param_names:
+            state.pop(prefix + pname, None)
+        for key, value in adapter.export_state(threshold).items():
+            state[prefix + key] = value
+    for name, submodule in module.named_modules():
+        shadow = getattr(submodule, "shadow", None)
+        target_name = shadow_target_name(submodule)
+        if shadow is None or target_name is None:
+            continue
+        prefix = f"{name}." if name else ""
+        state.pop(prefix + target_name, None)
     return state
 
 
@@ -261,15 +361,72 @@ def load_state_dict_with_size_gates(module: nn.Module, state_dict: dict[str, Ten
         prefix = f"{name}.size_adapter." if name else "size_adapter."
         if adapter is None or prefix + "active_idx" not in expanded:
             continue
-        idx = expanded.pop(prefix + "active_idx").to(dtype=torch.long)
-        active_down = expanded.pop(prefix + "active_down")
-        active_up = expanded.pop(prefix + "active_up")
-        down, up = torch.zeros_like(adapter.down), torch.zeros_like(adapter.up)
-        if idx.numel() > 0:
-            down.index_copy_(0, idx, active_down.to(dtype=down.dtype))
-            up.index_copy_(1, idx, active_up.to(dtype=up.dtype))
-        expanded[prefix + "down"], expanded[prefix + "up"] = down, up
+        compact = {"active_idx": expanded.pop(prefix + "active_idx")}
+        for pname in adapter.compact_param_names:
+            compact[f"active_{pname}"] = expanded.pop(prefix + f"active_{pname}")
+        for pname, value in adapter.load_export_state(compact).items():
+            expanded[prefix + pname] = value
+    for name, submodule in module.named_modules():
+        shadow = getattr(submodule, "shadow", None)
+        target_name = shadow_target_name(submodule)
+        prefix = f"{name}." if name else ""
+        if shadow is None or target_name is None or prefix + target_name in expanded:
+            continue
+        if prefix + "shadow.latent" not in expanded or prefix + "shadow.basis" not in expanded:
+            continue
+        shadow.latent.data.copy_(expanded[prefix + "shadow.latent"].to(dtype=shadow.latent.dtype))
+        shadow.basis.data.copy_(expanded[prefix + "shadow.basis"].to(dtype=shadow.basis.dtype))
+        weight = shadow.reconstruct(dtype=get_shadow_target_tensor(submodule).dtype)
+        threshold_name = shadow_threshold_name(submodule)
+        if threshold_name is not None:
+            weight = weight + expanded[prefix + threshold_name].to(dtype=weight.dtype)
+        expanded[prefix + target_name] = weight
     module.load_state_dict(expanded, strict=strict)
+
+
+def shadow_target_name(module: nn.Module) -> str | None:
+    if hasattr(module, "weight"):
+        return "weight"
+    if isinstance(module, BinaryLMHead) and isinstance(module.proj, CastedLinear):
+        return "proj.weight"
+    return None
+
+
+def shadow_threshold_name(module: nn.Module) -> str | None:
+    return "threshold" if hasattr(module, "threshold") else None
+
+
+def get_shadow_target_tensor(module: nn.Module) -> Tensor:
+    if hasattr(module, "weight"):
+        weight = module.weight
+        return weight - module.threshold if hasattr(module, "threshold") else weight
+    if isinstance(module, BinaryLMHead) and isinstance(module.proj, CastedLinear):
+        return module.proj.weight
+    raise TypeError(f"Unsupported shadow target for {type(module).__name__}")
+
+
+@torch.no_grad()
+def refresh_group_shadows(module: nn.Module) -> None:
+    for submodule in module.modules():
+        shadow = getattr(submodule, "shadow", None)
+        if shadow is not None:
+            shadow.init_from_weight(get_shadow_target_tensor(submodule))
+
+
+def module_shadow_loss(module: nn.Module) -> tuple[Tensor, Tensor]:
+    param = next(iter(module.parameters()), None)
+    device = param.device if param is not None else torch.device("cpu")
+    total_loss = torch.zeros((), device=device)
+    total_bytes = torch.zeros((), device=device)
+    for submodule in module.modules():
+        shadow = getattr(submodule, "shadow", None)
+        if shadow is None:
+            continue
+        target = get_shadow_target_tensor(submodule).detach().to(dtype=torch.float32)
+        recon = shadow.reconstruct(dtype=target.dtype).to(dtype=torch.float32)
+        total_loss = total_loss + F.mse_loss(recon, target)
+        total_bytes = total_bytes + shadow.expected_size_bytes()
+    return total_loss, total_bytes
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -735,6 +892,7 @@ class BinaryLinear(nn.Module):
         super().__init__()
         self.impl = os.environ.get("LINEAR_IMPL", "standard")
         gate_rank = int(os.environ.get("SIZE_GATED_RANK", 0))
+        shadow_group_size = int(os.environ.get("SHADOW_GROUP_SIZE", 0))
         self.size_adapter = (
             SizeGatedAdapter(
                 in_features,
@@ -760,6 +918,13 @@ class BinaryLinear(nn.Module):
         else:
             self.weight = nn.Parameter(torch.randn(out_features, in_features) * init_std)
             self.threshold = nn.Parameter(torch.zeros(out_features, 1))
+            self.shadow = (
+                ShadowGroupCompressor((out_features, in_features), shadow_group_size, float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0)))
+                if shadow_group_size > 1
+                else None
+            )
+            if self.shadow is not None:
+                self.shadow.init_from_weight(self.weight - self.threshold)
 
     def forward(self, x: Tensor) -> Tensor:
         return binary_linear_apply(x, self)
@@ -770,6 +935,7 @@ class BinaryWeightLinear(nn.Module):
         super().__init__()
         self.impl = os.environ.get("LINEAR_IMPL", "standard")
         gate_rank = int(os.environ.get("SIZE_GATED_RANK", 0))
+        shadow_group_size = int(os.environ.get("SHADOW_GROUP_SIZE", 0))
         self.size_adapter = (
             SizeGatedAdapter(
                 in_features,
@@ -794,6 +960,13 @@ class BinaryWeightLinear(nn.Module):
         else:
             self.weight = nn.Parameter(torch.randn(out_features, in_features) * init_std)
             self.threshold = nn.Parameter(torch.zeros(out_features, 1))
+            self.shadow = (
+                ShadowGroupCompressor((out_features, in_features), shadow_group_size, float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0)))
+                if shadow_group_size > 1
+                else None
+            )
+            if self.shadow is not None:
+                self.shadow.init_from_weight(self.weight - self.threshold)
         self.shift_param = nn.Parameter(torch.tensor(-4.0))
 
     def forward(self, x: Tensor) -> Tensor:
@@ -810,12 +983,34 @@ class BinaryEmbedding(nn.Module):
     def __init__(self, vocab_size: int, hidden_size: int, width_mult: int = 1, extra_layers: int = 1):
         super().__init__()
         self.impl = os.environ.get("EMBED_IMPL", "dense")
+        gate_rank = int(os.environ.get("SIZE_GATED_RANK", 0))
+        shadow_group_size = int(os.environ.get("SHADOW_GROUP_SIZE", 0))
         self.hidden_size = hidden_size
         self.inner_size = hidden_size * max(1, int(width_mult))
         self.weight = nn.Parameter(torch.randn(vocab_size, self.inner_size) * 0.02)
-        if self.impl == "binary":
+        self.size_adapter = (
+            SizeGatedEmbeddingAdapter(
+                vocab_size,
+                self.inner_size,
+                rank=gate_rank,
+                gate_init=float(os.environ.get("SIZE_GATE_INIT", -6.0)),
+                bytes_per_param=float(os.environ.get("SIZE_BYTES_PER_PARAM", 1.0)),
+            )
+            if gate_rank > 0
+            else None
+        )
+        self.compress_weight = self.impl == "binary" or self.size_adapter is not None
+        if self.compress_weight:
             self.threshold = nn.Parameter(torch.zeros(1, self.inner_size))
             self.shift_param = nn.Parameter(torch.tensor(-5.0))
+        self.shadow = (
+            ShadowGroupCompressor((vocab_size, self.inner_size), shadow_group_size, float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0)))
+            if shadow_group_size > 1
+            else None
+        )
+        if self.shadow is not None:
+            target = self.weight - self.threshold if self.compress_weight else self.weight
+            self.shadow.init_from_weight(target)
         self.lookup_norm = nn.RMSNorm(self.inner_size)
 
         if self.inner_size != hidden_size:
@@ -837,20 +1032,26 @@ class BinaryEmbedding(nn.Module):
             self.adapter_layers.append(layer)
 
     def binary_lookup_weight(self) -> Tensor:
-        if self.impl != "binary":
+        if not self.compress_weight:
             return self.weight
         return binarize(self.weight - self.threshold)
 
     def project(self, hidden_states: Tensor) -> Tensor:
         weight = self.binary_lookup_weight().to(dtype=hidden_states.dtype)
         logits = F.linear(hidden_states, weight)
-        return logits if self.impl != "binary" else logits * binary_shift_scale(self.shift_param)
+        if self.compress_weight:
+            logits = logits * binary_shift_scale(self.shift_param)
+        if self.size_adapter is not None:
+            logits = logits + self.size_adapter.project(hidden_states)
+        return logits
 
     def forward(self, input_ids: Tensor) -> Tensor:
         weight = self.binary_lookup_weight()
         hidden_states = F.embedding(input_ids, weight)
-        if self.impl == "binary":
+        if self.compress_weight:
             hidden_states = hidden_states * binary_shift_scale(self.shift_param)
+        if self.size_adapter is not None:
+            hidden_states = hidden_states + self.size_adapter.lookup(input_ids, hidden_states.dtype)
         hidden_states = self.lookup_norm(hidden_states)
         if self.proj is not None:
             hidden_states = self.proj(self.proj_norm(hidden_states))
@@ -863,12 +1064,20 @@ class BinaryLMHead(nn.Module):
     def __init__(self, hidden_size: int, vocab_size: int, use_norm: bool = True):
         super().__init__()
         self.impl = os.environ.get("HEAD_IMPL", "dense")
+        shadow_group_size = int(os.environ.get("SHADOW_GROUP_SIZE", 0))
         self.use_norm = use_norm
         self.norm = nn.RMSNorm(hidden_size) if use_norm else None
         self.proj = CastedLinear(hidden_size, vocab_size, bias=False) if self.impl != "binary" else BinaryWeightLinear(hidden_size, vocab_size)
+        self.shadow = (
+            ShadowGroupCompressor((vocab_size, hidden_size), shadow_group_size, float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0)))
+            if self.impl != "binary" and shadow_group_size > 1
+            else None
+        )
         if self.impl == "binary":
             with torch.no_grad():
                 self.proj.shift_param.fill_(-5.0)
+        elif self.shadow is not None:
+            self.shadow.init_from_weight(self.proj.weight)
 
     def forward(self, hidden_states: Tensor) -> Tensor:
         if self.norm is not None:
@@ -1069,6 +1278,7 @@ class GPT(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        refresh_group_shadows(self)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1303,6 +1513,10 @@ def main() -> None:
         f"size_gated_rank:{args.size_gated_rank} size_loss_weight:{args.size_loss_weight} "
         f"size_gate_init:{args.size_gate_init} size_export_threshold:{args.size_export_threshold}"
     )
+    log0(
+        f"shadow_group_size:{args.shadow_group_size} shadow_loss_weight:{args.shadow_loss_weight} "
+        f"shadow_bytes_per_param:{args.shadow_bytes_per_param}"
+    )
     log0(f"attn_chunk_size:{args.attn_chunk_size} checkpoint_blocks:{args.checkpoint_blocks}")
     log0(f"attention_heads:num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
@@ -1327,12 +1541,18 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-    def apply_size_loss(loss: Tensor) -> tuple[Tensor, Tensor]:
-        if args.size_gated_rank <= 0 or args.size_loss_weight <= 0:
-            return loss, torch.zeros((), device=loss.device)
-        size_mb = module_expected_size_bytes(base_model) / (1024.0 * 1024.0)
-        size_loss = size_mb * args.size_loss_weight
-        return loss + size_loss.to(dtype=loss.dtype), size_loss
+    def apply_aux_losses(loss: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        size_loss = torch.zeros((), device=loss.device)
+        shadow_loss = torch.zeros((), device=loss.device)
+        if args.size_gated_rank > 0 and args.size_loss_weight > 0:
+            size_mb = module_expected_size_bytes(base_model) / (1024.0 * 1024.0)
+            size_loss = size_mb * args.size_loss_weight
+            loss = loss + size_loss.to(dtype=loss.dtype)
+        if args.shadow_group_size > 1 and args.shadow_loss_weight > 0:
+            shadow_mse, _ = module_shadow_loss(base_model)
+            shadow_loss = shadow_mse * args.shadow_loss_weight
+            loss = loss + shadow_loss.to(dtype=loss.dtype)
+        return loss, size_loss, shadow_loss
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -1359,7 +1579,7 @@ def main() -> None:
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
-                warmup_loss, _ = apply_size_loss(warmup_loss)
+                warmup_loss, _, _ = apply_aux_losses(warmup_loss)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1425,6 +1645,7 @@ def main() -> None:
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         train_size_loss = torch.zeros((), device=device)
+        train_shadow_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1432,11 +1653,13 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
-            loss, size_loss = apply_size_loss(loss)
+            loss, size_loss, shadow_loss = apply_aux_losses(loss)
             train_size_loss += size_loss.detach()
+            train_shadow_loss += shadow_loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
         train_size_loss /= grad_accum_steps
+        train_shadow_loss /= grad_accum_steps
 
         if optimizer_muon is not None:
             frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1468,6 +1691,10 @@ def main() -> None:
             if args.size_gated_rank > 0:
                 size_mb = module_expected_size_bytes(base_model).detach().item() / (1024.0 * 1024.0)
                 msg = f"{msg} size_loss:{train_size_loss.item():.4f} size_mb:{size_mb:.4f}"
+            if args.shadow_group_size > 1:
+                shadow_mse, shadow_bytes = module_shadow_loss(base_model)
+                shadow_mb = shadow_bytes.detach().item() / (1024.0 * 1024.0)
+                msg = f"{msg} shadow_loss:{train_shadow_loss.item():.4f} shadow_mb:{shadow_mb:.4f} shadow_mse:{shadow_mse.detach().item():.4f}"
             log0(msg)
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
