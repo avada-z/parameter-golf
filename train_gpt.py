@@ -67,6 +67,7 @@ class Hyperparameters:
     shadow_bytes_per_param = float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0))
     shadow_scope = os.environ.get("SHADOW_SCOPE", "all" if attn_impl == "dense" and mlp_impl == "dense" else "embed,mlp,head")
     shadow_loss_metric = os.environ.get("SHADOW_LOSS_METRIC", "nmse")
+    shadow_compute_dtype = os.environ.get("SHADOW_COMPUTE_DTYPE", "auto")
     shadow_loss_stride = int(os.environ.get("SHADOW_LOSS_STRIDE", 4))
     attn_chunk_size = int(os.environ.get("ATTN_CHUNK_SIZE", 128))
     checkpoint_blocks = bool(int(os.environ.get("CHECKPOINT_BLOCKS", "0")))
@@ -310,6 +311,13 @@ def maybe_attach_shadow(module: nn.Module, role: str) -> nn.Module:
     return module
 
 
+def shadow_compute_dtype(device: torch.device) -> torch.dtype:
+    raw = os.environ.get("SHADOW_COMPUTE_DTYPE", "auto")
+    if raw == "auto":
+        return torch.bfloat16 if device.type == "cuda" else torch.float32
+    return getattr(torch, raw)
+
+
 class ShadowGroupCompressor(nn.Module):
     def __init__(self, shape: tuple[int, ...], group_size: int, bytes_per_param: float):
         super().__init__()
@@ -441,42 +449,67 @@ def refresh_group_shadows(module: nn.Module) -> None:
             shadow.init_from_weight(get_shadow_target_tensor(submodule))
 
 
+def shadow_modules(module: nn.Module) -> list[nn.Module]:
+    cached = getattr(module, "_shadow_modules_cache", None)
+    if cached is None:
+        cached = [submodule for submodule in module.modules() if getattr(submodule, "shadow", None) is not None]
+        setattr(module, "_shadow_modules_cache", cached)
+    return cached
+
+
 def module_shadow_metrics(module: nn.Module, stride: int = 1, phase: int = 0) -> tuple[Tensor, Tensor, Tensor]:
     param = next(iter(module.parameters()), None)
     device = param.device if param is not None else torch.device("cpu")
     total_mse = torch.zeros((), device=device)
     total_nmse = torch.zeros((), device=device)
     total_bytes = torch.zeros((), device=device)
-    shadow_modules = [submodule for submodule in module.modules() if getattr(submodule, "shadow", None) is not None]
-    if not shadow_modules:
+    shadow_submodules = shadow_modules(module)
+    if not shadow_submodules:
         return total_mse, total_nmse, total_bytes
     stride = max(1, int(stride))
     phase = phase % stride
     selected = 0
-    for idx, submodule in enumerate(shadow_modules):
+    touch = torch.zeros((), device=device)
+    buckets: dict[tuple[int, int, int], list[tuple[ShadowGroupCompressor, Tensor]]] = {}
+    total_modules = len(shadow_submodules)
+    total_shadow_bytes = None
+    compute_dtype = shadow_compute_dtype(device)
+    for idx, submodule in enumerate(shadow_submodules):
         shadow = getattr(submodule, "shadow", None)
         if shadow is None:
             continue
+        shadow_bytes = shadow.expected_size_bytes()
+        total_shadow_bytes = shadow_bytes if total_shadow_bytes is None else total_shadow_bytes + shadow_bytes
         if idx % stride != phase:
             # Keep skipped shadow params in the autograd graph so DDP does not
             # treat them as unused on this iteration.
-            touch = shadow.latent.sum() * 0.0 + shadow.basis.sum() * 0.0
-            total_mse = total_mse + touch
-            total_nmse = total_nmse + touch
+            touch = touch + shadow.latent.sum() * 0.0 + shadow.basis.sum() * 0.0
             continue
         selected += 1
         target = get_shadow_target_tensor(submodule).detach().to(dtype=torch.float32)
-        recon = shadow.reconstruct(dtype=target.dtype).to(dtype=torch.float32)
-        mse = F.mse_loss(recon, target)
-        nmse = mse / target.pow(2).mean().clamp_min(1e-8)
-        total_mse = total_mse + mse
-        total_nmse = total_nmse + nmse
-        total_bytes = total_bytes + shadow.expected_size_bytes()
-    if selected > 0 and selected < len(shadow_modules):
-        scale = len(shadow_modules) / selected
+        key = (shadow.num_groups, shadow.group_size, shadow.numel)
+        buckets.setdefault(key, []).append((shadow, target))
+    total_mse = total_mse + touch
+    total_nmse = total_nmse + touch
+    for num_groups, group_size, numel in buckets:
+        entries = buckets[(num_groups, group_size, numel)]
+        latents = torch.stack([shadow.latent for shadow, _ in entries], dim=0).to(dtype=compute_dtype)
+        basis = torch.stack([shadow.basis for shadow, _ in entries], dim=0).to(dtype=compute_dtype)
+        feat = torch.stack((latents, torch.tanh(latents), torch.ones_like(latents)), dim=-1)
+        flat = torch.bmm(feat, basis).reshape(len(entries), -1)[:, :numel]
+        targets = torch.stack([target.reshape(-1) for _, target in entries], dim=0).to(dtype=compute_dtype)
+        diff = (flat - targets).to(dtype=torch.float32)
+        target_f32 = targets.to(dtype=torch.float32)
+        mse = diff.square().mean(dim=1)
+        nmse = mse / target_f32.square().mean(dim=1).clamp_min(1e-8)
+        total_mse = total_mse + mse.sum()
+        total_nmse = total_nmse + nmse.sum()
+    if total_shadow_bytes is not None:
+        total_bytes = total_shadow_bytes
+    if selected > 0 and selected < total_modules:
+        scale = total_modules / selected
         total_mse = total_mse * scale
         total_nmse = total_nmse * scale
-        total_bytes = total_bytes * scale
     return total_mse, total_nmse, total_bytes
 
 
@@ -1602,7 +1635,7 @@ def main() -> None:
     log0(
         f"shadow_group_size:{args.shadow_group_size} shadow_loss_weight:{args.shadow_loss_weight} "
         f"shadow_bytes_per_param:{args.shadow_bytes_per_param} shadow_scope:{args.shadow_scope} "
-        f"shadow_loss_metric:{args.shadow_loss_metric} "
+        f"shadow_loss_metric:{args.shadow_loss_metric} shadow_compute_dtype:{args.shadow_compute_dtype} "
         f"shadow_loss_stride:{args.shadow_loss_stride}"
     )
     log0(f"attn_chunk_size:{args.attn_chunk_size} checkpoint_blocks:{args.checkpoint_blocks}")
