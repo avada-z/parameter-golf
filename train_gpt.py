@@ -63,6 +63,8 @@ class Hyperparameters:
     shadow_group_size = int(os.environ.get("SHADOW_GROUP_SIZE", 0))
     shadow_loss_weight = float(os.environ.get("SHADOW_LOSS_WEIGHT", 0.0))
     shadow_bytes_per_param = float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0))
+    shadow_scope = os.environ.get("SHADOW_SCOPE", "embed,mlp,head")
+    shadow_loss_stride = int(os.environ.get("SHADOW_LOSS_STRIDE", 4))
     attn_chunk_size = int(os.environ.get("ATTN_CHUNK_SIZE", 128))
     checkpoint_blocks = bool(int(os.environ.get("CHECKPOINT_BLOCKS", "0")))
 
@@ -282,6 +284,15 @@ class SizeGatedEmbeddingAdapter(nn.Module):
         return {"left": left, "right": right}
 
 
+def _csv_tokens(raw: str) -> set[str]:
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def shadow_scope_allows(role: str) -> bool:
+    scope = _csv_tokens(os.environ.get("SHADOW_SCOPE", "embed,mlp,head"))
+    return "all" in scope or role in scope
+
+
 class ShadowGroupCompressor(nn.Module):
     def __init__(self, shape: tuple[int, ...], group_size: int, bytes_per_param: float):
         super().__init__()
@@ -413,19 +424,30 @@ def refresh_group_shadows(module: nn.Module) -> None:
             shadow.init_from_weight(get_shadow_target_tensor(submodule))
 
 
-def module_shadow_loss(module: nn.Module) -> tuple[Tensor, Tensor]:
+def module_shadow_loss(module: nn.Module, stride: int = 1, phase: int = 0) -> tuple[Tensor, Tensor]:
     param = next(iter(module.parameters()), None)
     device = param.device if param is not None else torch.device("cpu")
     total_loss = torch.zeros((), device=device)
     total_bytes = torch.zeros((), device=device)
-    for submodule in module.modules():
+    shadow_modules = [submodule for submodule in module.modules() if getattr(submodule, "shadow", None) is not None]
+    if not shadow_modules:
+        return total_loss, total_bytes
+    stride = max(1, int(stride))
+    phase = phase % stride
+    selected = 0
+    for idx, submodule in enumerate(shadow_modules):
         shadow = getattr(submodule, "shadow", None)
-        if shadow is None:
+        if shadow is None or idx % stride != phase:
             continue
+        selected += 1
         target = get_shadow_target_tensor(submodule).detach().to(dtype=torch.float32)
         recon = shadow.reconstruct(dtype=target.dtype).to(dtype=torch.float32)
         total_loss = total_loss + F.mse_loss(recon, target)
         total_bytes = total_bytes + shadow.expected_size_bytes()
+    if selected > 0 and selected < len(shadow_modules):
+        scale = len(shadow_modules) / selected
+        total_loss = total_loss * scale
+        total_bytes = total_bytes * scale
     return total_loss, total_bytes
 
 def build_sentencepiece_luts(
@@ -888,7 +910,7 @@ def binary_linear_group(x: Tensor, *modules: nn.Module) -> list[Tensor]:
 
 
 class BinaryLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, init_std: float = 0.02):
+    def __init__(self, in_features: int, out_features: int, init_std: float = 0.02, shadow_role: str = "all"):
         super().__init__()
         self.impl = os.environ.get("LINEAR_IMPL", "standard")
         gate_rank = int(os.environ.get("SIZE_GATED_RANK", 0))
@@ -920,7 +942,7 @@ class BinaryLinear(nn.Module):
             self.threshold = nn.Parameter(torch.zeros(out_features, 1))
             self.shadow = (
                 ShadowGroupCompressor((out_features, in_features), shadow_group_size, float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0)))
-                if shadow_group_size > 1
+                if shadow_group_size > 1 and shadow_scope_allows(shadow_role)
                 else None
             )
             if self.shadow is not None:
@@ -931,7 +953,7 @@ class BinaryLinear(nn.Module):
 
 
 class BinaryWeightLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, init_std: float = 0.02):
+    def __init__(self, in_features: int, out_features: int, init_std: float = 0.02, shadow_role: str = "all"):
         super().__init__()
         self.impl = os.environ.get("LINEAR_IMPL", "standard")
         gate_rank = int(os.environ.get("SIZE_GATED_RANK", 0))
@@ -962,7 +984,7 @@ class BinaryWeightLinear(nn.Module):
             self.threshold = nn.Parameter(torch.zeros(out_features, 1))
             self.shadow = (
                 ShadowGroupCompressor((out_features, in_features), shadow_group_size, float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0)))
-                if shadow_group_size > 1
+                if shadow_group_size > 1 and shadow_scope_allows(shadow_role)
                 else None
             )
             if self.shadow is not None:
@@ -1005,7 +1027,7 @@ class BinaryEmbedding(nn.Module):
             self.shift_param = nn.Parameter(torch.tensor(-5.0))
         self.shadow = (
             ShadowGroupCompressor((vocab_size, self.inner_size), shadow_group_size, float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0)))
-            if shadow_group_size > 1
+            if shadow_group_size > 1 and shadow_scope_allows("embed")
             else None
         )
         if self.shadow is not None:
@@ -1015,7 +1037,7 @@ class BinaryEmbedding(nn.Module):
 
         if self.inner_size != hidden_size:
             self.proj_norm = nn.RMSNorm(self.inner_size)
-            self.proj = BinaryWeightLinear(self.inner_size, hidden_size)
+            self.proj = BinaryWeightLinear(self.inner_size, hidden_size, shadow_role="embed")
             with torch.no_grad():
                 self.proj.shift_param.fill_(-5.0)
         else:
@@ -1026,7 +1048,7 @@ class BinaryEmbedding(nn.Module):
         self.adapter_layers = nn.ModuleList()
         for _ in range(max(0, int(extra_layers))):
             self.adapter_norms.append(nn.RMSNorm(hidden_size))
-            layer = BinaryWeightLinear(hidden_size, hidden_size)
+            layer = BinaryWeightLinear(hidden_size, hidden_size, shadow_role="embed")
             with torch.no_grad():
                 layer.shift_param.fill_(-6.0)
             self.adapter_layers.append(layer)
@@ -1070,7 +1092,7 @@ class BinaryLMHead(nn.Module):
         self.proj = CastedLinear(hidden_size, vocab_size, bias=False) if self.impl != "binary" else BinaryWeightLinear(hidden_size, vocab_size)
         self.shadow = (
             ShadowGroupCompressor((vocab_size, hidden_size), shadow_group_size, float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0)))
-            if self.impl != "binary" and shadow_group_size > 1
+            if self.impl != "binary" and shadow_group_size > 1 and shadow_scope_allows("head")
             else None
         )
         if self.impl == "binary":
@@ -1134,10 +1156,10 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
         self.norm = nn.RMSNorm(dim)
-        self.q_proj = BinaryLinear(dim, dim)
-        self.k_proj = BinaryLinear(dim, kv_dim)
-        self.v_proj = BinaryLinear(dim, kv_dim)
-        self.proj = BinaryWeightLinear(dim, dim)
+        self.q_proj = BinaryLinear(dim, dim, shadow_role="attn")
+        self.k_proj = BinaryLinear(dim, kv_dim, shadow_role="attn")
+        self.v_proj = BinaryLinear(dim, kv_dim, shadow_role="attn")
+        self.proj = BinaryWeightLinear(dim, dim, shadow_role="attn")
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.mode = os.environ.get("ATTENTION_MODE", "binary_relu2")
         self.margin = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
@@ -1184,10 +1206,10 @@ class MLP(nn.Module):
         super().__init__()
         hidden = mlp_mult * dim
         self.norm = nn.RMSNorm(dim)
-        self.gate = BinaryLinear(dim, hidden)
-        self.up = BinaryLinear(dim, hidden)
+        self.gate = BinaryLinear(dim, hidden, shadow_role="mlp")
+        self.up = BinaryLinear(dim, hidden, shadow_role="mlp")
         self.mid_norm = nn.RMSNorm(hidden)
-        self.proj = BinaryWeightLinear(hidden, dim)
+        self.proj = BinaryWeightLinear(hidden, dim, shadow_role="mlp")
 
     def forward(self, x: Tensor) -> Tensor:
         h = self.norm(x)
@@ -1515,7 +1537,8 @@ def main() -> None:
     )
     log0(
         f"shadow_group_size:{args.shadow_group_size} shadow_loss_weight:{args.shadow_loss_weight} "
-        f"shadow_bytes_per_param:{args.shadow_bytes_per_param}"
+        f"shadow_bytes_per_param:{args.shadow_bytes_per_param} shadow_scope:{args.shadow_scope} "
+        f"shadow_loss_stride:{args.shadow_loss_stride}"
     )
     log0(f"attn_chunk_size:{args.attn_chunk_size} checkpoint_blocks:{args.checkpoint_blocks}")
     log0(f"attention_heads:num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1541,18 +1564,21 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-    def apply_aux_losses(loss: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        size_loss = torch.zeros((), device=loss.device)
-        shadow_loss = torch.zeros((), device=loss.device)
+    def aux_losses(step_idx: int, full_shadow: bool = False) -> tuple[Tensor, Tensor, Tensor]:
+        param = next(iter(base_model.parameters()), None)
+        device_for_aux = param.device if param is not None else device
+        size_loss = torch.zeros((), device=device_for_aux)
+        shadow_loss = torch.zeros((), device=device_for_aux)
         if args.size_gated_rank > 0 and args.size_loss_weight > 0:
             size_mb = module_expected_size_bytes(base_model) / (1024.0 * 1024.0)
             size_loss = size_mb * args.size_loss_weight
-            loss = loss + size_loss.to(dtype=loss.dtype)
         if args.shadow_group_size > 1 and args.shadow_loss_weight > 0:
-            shadow_mse, _ = module_shadow_loss(base_model)
+            shadow_stride = 1 if full_shadow else max(args.shadow_loss_stride, 1)
+            shadow_phase = 0 if full_shadow else step_idx % shadow_stride
+            shadow_mse, _ = module_shadow_loss(base_model, stride=shadow_stride, phase=shadow_phase)
             shadow_loss = shadow_mse * args.shadow_loss_weight
-            loss = loss + shadow_loss.to(dtype=loss.dtype)
-        return loss, size_loss, shadow_loss
+        aux = size_loss + shadow_loss
+        return size_loss, shadow_loss, aux
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -1579,8 +1605,10 @@ def main() -> None:
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
-                warmup_loss, _, _ = apply_aux_losses(warmup_loss)
                 (warmup_loss * grad_scale).backward()
+            _, _, warmup_aux = aux_losses(warmup_step)
+            if warmup_aux.requires_grad:
+                warmup_aux.backward()
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
@@ -1653,13 +1681,13 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
-            loss, size_loss, shadow_loss = apply_aux_losses(loss)
-            train_size_loss += size_loss.detach()
-            train_shadow_loss += shadow_loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        train_size_loss /= grad_accum_steps
-        train_shadow_loss /= grad_accum_steps
+        size_loss, shadow_loss, aux_loss = aux_losses(step)
+        train_size_loss = size_loss.detach()
+        train_shadow_loss = shadow_loss.detach()
+        if aux_loss.requires_grad:
+            aux_loss.backward()
 
         if optimizer_muon is not None:
             frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1692,7 +1720,7 @@ def main() -> None:
                 size_mb = module_expected_size_bytes(base_model).detach().item() / (1024.0 * 1024.0)
                 msg = f"{msg} size_loss:{train_size_loss.item():.4f} size_mb:{size_mb:.4f}"
             if args.shadow_group_size > 1:
-                shadow_mse, shadow_bytes = module_shadow_loss(base_model)
+                shadow_mse, shadow_bytes = module_shadow_loss(base_model, stride=1, phase=0)
                 shadow_mb = shadow_bytes.detach().item() / (1024.0 * 1024.0)
                 msg = f"{msg} shadow_loss:{train_shadow_loss.item():.4f} shadow_mb:{shadow_mb:.4f} shadow_mse:{shadow_mse.detach().item():.4f}"
             log0(msg)
