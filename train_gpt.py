@@ -55,6 +55,9 @@ class Hyperparameters:
     sine_k = int(os.environ.get("SINE_K", 16))
     sine_m = int(os.environ.get("SINE_M", 1))
     attention_mode = os.environ.get("ATTENTION_MODE", "binary_relu2")
+    binary_optimizer = os.environ.get("BINARY_OPTIMIZER", "muon")
+    bop_adaptivity = float(os.environ.get("BOP_ADAPTIVITY", 1e-3))
+    bop_threshold = float(os.environ.get("BOP_THRESHOLD", 1e-4))
     attn_chunk_size = int(os.environ.get("ATTN_CHUNK_SIZE", 128))
     checkpoint_blocks = bool(int(os.environ.get("CHECKPOINT_BLOCKS", "0")))
 
@@ -181,6 +184,34 @@ class Muon(torch.optim.Optimizer):
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
+        return loss
+
+
+class BOP(torch.optim.Optimizer):
+    def __init__(self, params, threshold_map: dict[int, Tensor], adaptivity: float, threshold: float):
+        super().__init__(params, dict(lr=1.0, adaptivity=adaptivity, threshold=threshold))
+        self.threshold_map = threshold_map
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            a = group["adaptivity"] * group["lr"]
+            tflip = group["threshold"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                m = self.state[p].setdefault("m", torch.zeros_like(p, dtype=torch.float32))
+                m.mul_(1 - a).add_(p.grad.float(), alpha=a)
+                thr = self.threshold_map[id(p)].float()
+                centered = p.float() - thr
+                mask = (m.abs() >= tflip) & (m.sign() == centered.sign())
+                centered[mask].neg_()
+                p.copy_((centered + thr).to(dtype=p.dtype))
+                m[mask] = 0
         return loss
 
 
@@ -1191,12 +1222,19 @@ def main() -> None:
         name for name, p in named_params
         if name.startswith("lm_head") and p.ndim == 2
     }
+    binary_thresholds = {
+        f"{name.removesuffix('.threshold')}.weight": p
+        for name, p in named_params
+        if name.endswith(".threshold")
+    }
+    bop_weight_names = set(binary_thresholds) if args.binary_optimizer == "bop" else set()
     excluded_matrix_names = {token_weight_name, *head_matrix_names}
     matrix_params = [
         p
         for name, p in named_params
         if (
             name not in excluded_matrix_names
+            and name not in bop_weight_names
             and p.ndim == 2
             and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         )
@@ -1209,30 +1247,45 @@ def main() -> None:
             and (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         )
     ]
-    token_params = [p for name, p in named_params if name == token_weight_name]
-    head_params = [p for name, p in named_params if name in head_matrix_names]
+    token_params = [p for name, p in named_params if name == token_weight_name and name not in bop_weight_names]
+    head_params = [p for name, p in named_params if name in head_matrix_names and name not in bop_weight_names]
+    bop_params = [p for name, p in named_params if name in bop_weight_names]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
-        [{"params": token_params, "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
+    optimizer_bop = None
+    optimizer_tok = None
+    if token_params:
+        optimizer_tok = torch.optim.Adam(
+            [{"params": token_params, "lr": token_lr, "base_lr": token_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+    if bop_params:
+        optimizer_bop = BOP(
+            bop_params,
+            threshold_map={id(p): binary_thresholds[name] for name, p in named_params if name in bop_weight_names},
+            adaptivity=args.bop_adaptivity,
+            threshold=args.bop_threshold,
+        )
+        for group in optimizer_bop.param_groups:
+            group["base_lr"] = 1.0
+    optimizer_muon = None
+    if matrix_params:
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [opt for opt in (optimizer_tok, optimizer_bop, optimizer_muon, optimizer_scalar) if opt is not None]
     if head_params:
         optimizer_head = torch.optim.Adam(
             [{"params": head_params, "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1240,7 +1293,7 @@ def main() -> None:
             eps=args.adam_eps,
             fused=True,
         )
-        optimizers.insert(1, optimizer_head)
+        optimizers.insert(1 if optimizer_tok is not None else 0, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1249,12 +1302,12 @@ def main() -> None:
         compile_status = f"{compile_status} tweaks={','.join(compile_tweaks)}"
     log0(f"compile:{compile_status}")
     log0(f"attention_mode:{args.attention_mode}_gqa")
-    log0(f"linear_impl:{args.linear_impl} sine_k:{args.sine_k} sine_m:{args.sine_m}")
+    log0(f"linear_impl:{args.linear_impl} sine_k:{args.sine_k} sine_m:{args.sine_m} binary_optimizer:{args.binary_optimizer}")
     log0(f"embed_impl:{args.embed_impl} head_impl:{args.head_impl}")
     log0(f"attn_chunk_size:{args.attn_chunk_size} checkpoint_blocks:{args.checkpoint_blocks}")
     log0(f"attention_heads:num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr if token_params else 0.0} "
         f"head_lr:{args.head_lr if head_params else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
@@ -1384,10 +1437,11 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        if optimizer_muon is not None:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
