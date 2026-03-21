@@ -661,7 +661,8 @@ def scale_head_axis(x: Tensor, scale: Tensor) -> Tensor:
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
         for name, param in module.named_parameters():
-            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+            keep_bf16 = name.endswith(".weight") and "norm" in name
+            if not keep_bf16 and (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
 
