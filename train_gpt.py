@@ -69,6 +69,9 @@ class Hyperparameters:
     shadow_loss_metric = os.environ.get("SHADOW_LOSS_METRIC", "nmse")
     shadow_compute_dtype = os.environ.get("SHADOW_COMPUTE_DTYPE", "auto")
     shadow_loss_stride = int(os.environ.get("SHADOW_LOSS_STRIDE", 4))
+    shadow_behavior_weight = float(os.environ.get("SHADOW_BEHAVIOR_WEIGHT", 0.0))
+    shadow_behavior_stride = int(os.environ.get("SHADOW_BEHAVIOR_STRIDE", 1))
+    shadow_behavior_temperature = float(os.environ.get("SHADOW_BEHAVIOR_TEMPERATURE", 1.0))
     attn_chunk_size = int(os.environ.get("ATTN_CHUNK_SIZE", 128))
     checkpoint_blocks = bool(int(os.environ.get("CHECKPOINT_BLOCKS", "0")))
 
@@ -316,6 +319,21 @@ def shadow_compute_dtype(device: torch.device) -> torch.dtype:
     if raw == "auto":
         return torch.bfloat16 if device.type == "cuda" else torch.float32
     return getattr(torch, raw)
+
+
+def dense_linear_apply(module: nn.Linear, x: Tensor, use_shadow: bool = False) -> Tensor:
+    if use_shadow:
+        shadow = getattr(module, "shadow", None)
+        if shadow is not None:
+            weight = shadow.reconstruct(dtype=x.dtype)
+            bias = module.bias.to(dtype=x.dtype) if module.bias is not None else None
+        else:
+            weight = module.weight.detach().to(dtype=x.dtype)
+            bias = module.bias.detach().to(dtype=x.dtype) if module.bias is not None else None
+    else:
+        weight = module.weight.to(dtype=x.dtype)
+        bias = module.bias.to(dtype=x.dtype) if module.bias is not None else None
+    return F.linear(x, weight, bias)
 
 
 class ShadowGroupCompressor(nn.Module):
@@ -1126,8 +1144,15 @@ class BinaryEmbedding(nn.Module):
             return self.weight
         return binarize(self.weight - self.threshold)
 
-    def project(self, hidden_states: Tensor) -> Tensor:
-        weight = self.binary_lookup_weight().to(dtype=hidden_states.dtype)
+    def _lookup_weight(self, dtype: torch.dtype, use_shadow: bool = False) -> Tensor:
+        if use_shadow:
+            if self.shadow is not None:
+                return self.shadow.reconstruct(dtype=dtype)
+            return self.binary_lookup_weight().detach().to(dtype=dtype)
+        return self.binary_lookup_weight().to(dtype=dtype)
+
+    def project(self, hidden_states: Tensor, use_shadow: bool = False) -> Tensor:
+        weight = self._lookup_weight(hidden_states.dtype, use_shadow=use_shadow)
         logits = F.linear(hidden_states, weight)
         if self.compress_weight:
             logits = logits * binary_shift_scale(self.shift_param)
@@ -1135,8 +1160,8 @@ class BinaryEmbedding(nn.Module):
             logits = logits + self.size_adapter.project(hidden_states)
         return logits
 
-    def forward(self, input_ids: Tensor) -> Tensor:
-        weight = self.binary_lookup_weight()
+    def forward(self, input_ids: Tensor, use_shadow: bool = False) -> Tensor:
+        weight = self._lookup_weight(self.weight.dtype, use_shadow=use_shadow)
         hidden_states = F.embedding(input_ids, weight)
         if self.compress_weight:
             hidden_states = hidden_states * binary_shift_scale(self.shift_param)
@@ -1169,9 +1194,11 @@ class BinaryLMHead(nn.Module):
         elif self.shadow is not None:
             self.shadow.init_from_weight(self.proj.weight)
 
-    def forward(self, hidden_states: Tensor) -> Tensor:
+    def forward(self, hidden_states: Tensor, use_shadow: bool = False) -> Tensor:
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
+        if self.impl != "binary":
+            return dense_linear_apply(self.proj, hidden_states, use_shadow=use_shadow)
         return self.proj(hidden_states)
 class Rotary(nn.Module):
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1242,11 +1269,15 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim, base=rope_base)
         self.attn_chunk_size = max(0, int(os.environ.get("ATTN_CHUNK_SIZE", 128)))
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, use_shadow: bool = False) -> Tensor:
         bsz, seqlen, dim = x.shape
         h = self.norm(x)
         qkv = (
-            [self.q_proj(h), self.k_proj(h), self.v_proj(h)]
+            [
+                dense_linear_apply(self.q_proj, h, use_shadow=use_shadow),
+                dense_linear_apply(self.k_proj, h, use_shadow=use_shadow),
+                dense_linear_apply(self.v_proj, h, use_shadow=use_shadow),
+            ]
             if self.impl == "dense"
             else binary_linear_group(h, self.q_proj, self.k_proj, self.v_proj)
         )
@@ -1279,7 +1310,7 @@ class CausalSelfAttention(nn.Module):
                 y = y + attn_chunk @ v[:, :, start:end, :]
             y = y / (2 ** round_ste(torch.log2(attn_sum + 1e-6)))
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return dense_linear_apply(self.proj, y, use_shadow=use_shadow) if self.impl == "dense" else self.proj(y)
 
 
 class MLP(nn.Module):
@@ -1299,11 +1330,11 @@ class MLP(nn.Module):
             self.mid_norm = nn.RMSNorm(hidden)
             self.proj = BinaryWeightLinear(hidden, dim, shadow_role="mlp")
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, use_shadow: bool = False) -> Tensor:
         h = self.norm(x)
         if self.impl == "dense":
-            h = torch.relu(self.fc(h))
-            return self.proj(h.square())
+            h = torch.relu(dense_linear_apply(self.fc, h, use_shadow=use_shadow))
+            return dense_linear_apply(self.proj, h.square(), use_shadow=use_shadow)
         gate, up = binary_linear_group(h, self.gate, self.up)
         h = gate * up
         return self.proj(self.mid_norm(h))
@@ -1329,11 +1360,11 @@ class Block(nn.Module):
         self.resid_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_skip = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, use_shadow: bool = False) -> Tensor:
         x = scale_last_dim(x, self.resid_scale) + scale_last_dim(x0, self.resid_skip)
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), use_shadow=use_shadow)
         x = x + scale_last_dim(attn_out, self.attn_scale)
-        x = x + scale_last_dim(self.mlp(self.mlp_norm(x)), self.mlp_scale)
+        x = x + scale_last_dim(self.mlp(self.mlp_norm(x), use_shadow=use_shadow), self.mlp_scale)
         return x
 
 
@@ -1396,11 +1427,15 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
         refresh_group_shadows(self)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+    def forward_logits(self, input_ids: Tensor, use_shadow: bool = False) -> Tensor:
+        x = self.tok_emb(input_ids, use_shadow=use_shadow)
         x0 = x
         skips: list[Tensor] = []
-        run_block = (lambda block, a, b: checkpoint(lambda aa, bb: block(aa, bb), a, b, use_reentrant=False)) if self.checkpoint_blocks and self.training else (lambda block, a, b: block(a, b))
+        run_block = (
+            (lambda block, a, b: checkpoint(lambda aa, bb: block(aa, bb, use_shadow=use_shadow), a, b, use_reentrant=False))
+            if self.checkpoint_blocks and self.training and not use_shadow
+            else (lambda block, a, b: block(a, b, use_shadow=use_shadow))
+        )
 
         for i in range(self.num_encoder_layers):
             x = run_block(self.blocks[i], x, x0)
@@ -1410,15 +1445,30 @@ class GPT(nn.Module):
                 x = x + scale_last_dim(skips.pop(), self.skip_weights[i])
             x = run_block(self.blocks[self.num_encoder_layers + i], x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
-            logits_proj = self.tok_emb.project(x)
+            logits_proj = self.tok_emb.project(x, use_shadow=use_shadow)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+            logits_proj = self.lm_head(x, use_shadow=use_shadow)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor | None = None,
+        *,
+        return_logits: bool = False,
+        use_shadow: bool = False,
+    ) -> Tensor:
+        logits = self.forward_logits(input_ids, use_shadow=use_shadow)
+        if return_logits:
+            return logits
+        if target_ids is None:
+            raise ValueError("target_ids is required unless return_logits=True")
+        targets = target_ids.reshape(-1)
+        logits = logits.reshape(-1, logits.size(-1))
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
@@ -1636,7 +1686,8 @@ def main() -> None:
         f"shadow_group_size:{args.shadow_group_size} shadow_loss_weight:{args.shadow_loss_weight} "
         f"shadow_bytes_per_param:{args.shadow_bytes_per_param} shadow_scope:{args.shadow_scope} "
         f"shadow_loss_metric:{args.shadow_loss_metric} shadow_compute_dtype:{args.shadow_compute_dtype} "
-        f"shadow_loss_stride:{args.shadow_loss_stride}"
+        f"shadow_loss_stride:{args.shadow_loss_stride} shadow_behavior_weight:{args.shadow_behavior_weight} "
+        f"shadow_behavior_stride:{args.shadow_behavior_stride} shadow_behavior_temperature:{args.shadow_behavior_temperature}"
     )
     log0(f"attn_chunk_size:{args.attn_chunk_size} checkpoint_blocks:{args.checkpoint_blocks}")
     log0(f"attention_heads:num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1662,11 +1713,12 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-    def aux_losses(step_idx: int, full_shadow: bool = False) -> tuple[Tensor, Tensor, Tensor]:
+    def aux_losses(step_idx: int, distill_input_ids: Tensor | None = None, full_shadow: bool = False) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         param = next(iter(base_model.parameters()), None)
         device_for_aux = param.device if param is not None else device
         size_loss = torch.zeros((), device=device_for_aux)
         shadow_loss = torch.zeros((), device=device_for_aux)
+        behavior_loss = torch.zeros((), device=device_for_aux)
         if args.size_gated_rank > 0 and args.size_loss_weight > 0:
             size_mb = module_expected_size_bytes(base_model) / (1024.0 * 1024.0)
             size_loss = size_mb * args.size_loss_weight
@@ -1675,8 +1727,23 @@ def main() -> None:
             shadow_phase = 0 if full_shadow else step_idx % shadow_stride
             shadow_metric, _ = module_shadow_loss(base_model, stride=shadow_stride, phase=shadow_phase)
             shadow_loss = shadow_metric * args.shadow_loss_weight
-        aux = size_loss + shadow_loss
-        return size_loss, shadow_loss, aux
+        if (
+            distill_input_ids is not None
+            and args.shadow_group_size > 1
+            and args.shadow_behavior_weight > 0
+            and (full_shadow or step_idx % max(args.shadow_behavior_stride, 1) == 0)
+        ):
+            temperature = max(args.shadow_behavior_temperature, 1e-4)
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    teacher_logits = model(distill_input_ids, return_logits=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                student_logits = model(distill_input_ids, return_logits=True, use_shadow=True)
+            teacher_probs = F.softmax((teacher_logits.float() / temperature).reshape(-1, teacher_logits.size(-1)), dim=-1)
+            student_log_probs = F.log_softmax((student_logits.float() / temperature).reshape(-1, student_logits.size(-1)), dim=-1)
+            behavior_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature * temperature * args.shadow_behavior_weight)
+        aux = size_loss + shadow_loss + behavior_loss
+        return size_loss, shadow_loss, behavior_loss, aux
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -1697,14 +1764,16 @@ def main() -> None:
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
+            warmup_x = None
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                warmup_x = x
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
-            _, _, warmup_aux = aux_losses(warmup_step)
+            _, _, _, warmup_aux = aux_losses(warmup_step, distill_input_ids=warmup_x)
             if warmup_aux.requires_grad:
                 warmup_aux.backward()
             for opt in optimizers:
@@ -1772,18 +1841,22 @@ def main() -> None:
         train_loss = torch.zeros((), device=device)
         train_size_loss = torch.zeros((), device=device)
         train_shadow_loss = torch.zeros((), device=device)
+        train_behavior_loss = torch.zeros((), device=device)
+        distill_x = None
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            distill_x = x
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        size_loss, shadow_loss, aux_loss = aux_losses(step)
+        size_loss, shadow_loss, behavior_loss, aux_loss = aux_losses(step, distill_input_ids=distill_x)
         train_size_loss = size_loss.detach()
         train_shadow_loss = shadow_loss.detach()
+        train_behavior_loss = behavior_loss.detach()
         if aux_loss.requires_grad:
             aux_loss.backward()
 
@@ -1822,6 +1895,7 @@ def main() -> None:
                 shadow_mb = shadow_bytes.detach().item() / (1024.0 * 1024.0)
                 msg = (
                     f"{msg} shadow_loss:{train_shadow_loss.item():.4f} "
+                    f"shadow_behavior_loss:{train_behavior_loss.item():.4f} "
                     f"shadow_budget_mb:{shadow_mb:.4f} shadow_mse:{shadow_mse.detach().item():.4f} "
                     f"shadow_nmse:{shadow_nmse.detach().item():.4f}"
                 )
