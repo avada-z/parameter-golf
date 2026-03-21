@@ -437,7 +437,12 @@ def module_shadow_loss(module: nn.Module, stride: int = 1, phase: int = 0) -> tu
     selected = 0
     for idx, submodule in enumerate(shadow_modules):
         shadow = getattr(submodule, "shadow", None)
-        if shadow is None or idx % stride != phase:
+        if shadow is None:
+            continue
+        if idx % stride != phase:
+            # Keep skipped shadow params in the autograd graph so DDP does not
+            # treat them as unused on this iteration.
+            total_loss = total_loss + shadow.latent.sum() * 0.0 + shadow.basis.sum() * 0.0
             continue
         selected += 1
         target = get_shadow_target_tensor(submodule).detach().to(dtype=torch.float32)
