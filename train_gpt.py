@@ -65,7 +65,8 @@ class Hyperparameters:
     shadow_group_size = int(os.environ.get("SHADOW_GROUP_SIZE", 0))
     shadow_loss_weight = float(os.environ.get("SHADOW_LOSS_WEIGHT", 0.0))
     shadow_bytes_per_param = float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0))
-    shadow_scope = os.environ.get("SHADOW_SCOPE", "embed,mlp,head")
+    shadow_scope = os.environ.get("SHADOW_SCOPE", "all" if attn_impl == "dense" and mlp_impl == "dense" else "embed,mlp,head")
+    shadow_loss_metric = os.environ.get("SHADOW_LOSS_METRIC", "nmse")
     shadow_loss_stride = int(os.environ.get("SHADOW_LOSS_STRIDE", 4))
     attn_chunk_size = int(os.environ.get("ATTN_CHUNK_SIZE", 128))
     checkpoint_blocks = bool(int(os.environ.get("CHECKPOINT_BLOCKS", "0")))
@@ -290,8 +291,14 @@ def _csv_tokens(raw: str) -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def default_shadow_scope() -> str:
+    attn_impl = os.environ.get("ATTN_IMPL", "binary")
+    mlp_impl = os.environ.get("MLP_IMPL", "binary")
+    return "all" if attn_impl == "dense" and mlp_impl == "dense" else "embed,mlp,head"
+
+
 def shadow_scope_allows(role: str) -> bool:
-    scope = _csv_tokens(os.environ.get("SHADOW_SCOPE", "embed,mlp,head"))
+    scope = _csv_tokens(os.environ.get("SHADOW_SCOPE", default_shadow_scope()))
     return "all" in scope or role in scope
 
 
@@ -434,14 +441,15 @@ def refresh_group_shadows(module: nn.Module) -> None:
             shadow.init_from_weight(get_shadow_target_tensor(submodule))
 
 
-def module_shadow_loss(module: nn.Module, stride: int = 1, phase: int = 0) -> tuple[Tensor, Tensor]:
+def module_shadow_metrics(module: nn.Module, stride: int = 1, phase: int = 0) -> tuple[Tensor, Tensor, Tensor]:
     param = next(iter(module.parameters()), None)
     device = param.device if param is not None else torch.device("cpu")
-    total_loss = torch.zeros((), device=device)
+    total_mse = torch.zeros((), device=device)
+    total_nmse = torch.zeros((), device=device)
     total_bytes = torch.zeros((), device=device)
     shadow_modules = [submodule for submodule in module.modules() if getattr(submodule, "shadow", None) is not None]
     if not shadow_modules:
-        return total_loss, total_bytes
+        return total_mse, total_nmse, total_bytes
     stride = max(1, int(stride))
     phase = phase % stride
     selected = 0
@@ -452,18 +460,30 @@ def module_shadow_loss(module: nn.Module, stride: int = 1, phase: int = 0) -> tu
         if idx % stride != phase:
             # Keep skipped shadow params in the autograd graph so DDP does not
             # treat them as unused on this iteration.
-            total_loss = total_loss + shadow.latent.sum() * 0.0 + shadow.basis.sum() * 0.0
+            touch = shadow.latent.sum() * 0.0 + shadow.basis.sum() * 0.0
+            total_mse = total_mse + touch
+            total_nmse = total_nmse + touch
             continue
         selected += 1
         target = get_shadow_target_tensor(submodule).detach().to(dtype=torch.float32)
         recon = shadow.reconstruct(dtype=target.dtype).to(dtype=torch.float32)
-        total_loss = total_loss + F.mse_loss(recon, target)
+        mse = F.mse_loss(recon, target)
+        nmse = mse / target.pow(2).mean().clamp_min(1e-8)
+        total_mse = total_mse + mse
+        total_nmse = total_nmse + nmse
         total_bytes = total_bytes + shadow.expected_size_bytes()
     if selected > 0 and selected < len(shadow_modules):
         scale = len(shadow_modules) / selected
-        total_loss = total_loss * scale
+        total_mse = total_mse * scale
+        total_nmse = total_nmse * scale
         total_bytes = total_bytes * scale
-    return total_loss, total_bytes
+    return total_mse, total_nmse, total_bytes
+
+
+def module_shadow_loss(module: nn.Module, stride: int = 1, phase: int = 0) -> tuple[Tensor, Tensor]:
+    mse, nmse, total_bytes = module_shadow_metrics(module, stride=stride, phase=phase)
+    metric = os.environ.get("SHADOW_LOSS_METRIC", "nmse")
+    return (nmse if metric == "nmse" else mse), total_bytes
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -1582,6 +1602,7 @@ def main() -> None:
     log0(
         f"shadow_group_size:{args.shadow_group_size} shadow_loss_weight:{args.shadow_loss_weight} "
         f"shadow_bytes_per_param:{args.shadow_bytes_per_param} shadow_scope:{args.shadow_scope} "
+        f"shadow_loss_metric:{args.shadow_loss_metric} "
         f"shadow_loss_stride:{args.shadow_loss_stride}"
     )
     log0(f"attn_chunk_size:{args.attn_chunk_size} checkpoint_blocks:{args.checkpoint_blocks}")
@@ -1619,8 +1640,8 @@ def main() -> None:
         if args.shadow_group_size > 1 and args.shadow_loss_weight > 0:
             shadow_stride = 1 if full_shadow else max(args.shadow_loss_stride, 1)
             shadow_phase = 0 if full_shadow else step_idx % shadow_stride
-            shadow_mse, _ = module_shadow_loss(base_model, stride=shadow_stride, phase=shadow_phase)
-            shadow_loss = shadow_mse * args.shadow_loss_weight
+            shadow_metric, _ = module_shadow_loss(base_model, stride=shadow_stride, phase=shadow_phase)
+            shadow_loss = shadow_metric * args.shadow_loss_weight
         aux = size_loss + shadow_loss
         return size_loss, shadow_loss, aux
 
@@ -1764,9 +1785,13 @@ def main() -> None:
                 size_mb = module_expected_size_bytes(base_model).detach().item() / (1024.0 * 1024.0)
                 msg = f"{msg} size_loss:{train_size_loss.item():.4f} size_mb:{size_mb:.4f}"
             if args.shadow_group_size > 1:
-                shadow_mse, shadow_bytes = module_shadow_loss(base_model, stride=1, phase=0)
+                shadow_mse, shadow_nmse, shadow_bytes = module_shadow_metrics(base_model, stride=1, phase=0)
                 shadow_mb = shadow_bytes.detach().item() / (1024.0 * 1024.0)
-                msg = f"{msg} shadow_loss:{train_shadow_loss.item():.4f} shadow_mb:{shadow_mb:.4f} shadow_mse:{shadow_mse.detach().item():.4f}"
+                msg = (
+                    f"{msg} shadow_loss:{train_shadow_loss.item():.4f} "
+                    f"shadow_budget_mb:{shadow_mb:.4f} shadow_mse:{shadow_mse.detach().item():.4f} "
+                    f"shadow_nmse:{shadow_nmse.detach().item():.4f}"
+                )
             log0(msg)
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
