@@ -47,6 +47,8 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     linear_impl = os.environ.get("LINEAR_IMPL", "standard")
+    attn_impl = os.environ.get("ATTN_IMPL", "binary")
+    mlp_impl = os.environ.get("MLP_IMPL", "binary")
     embed_impl = os.environ.get("EMBED_IMPL", "dense")
     head_impl = os.environ.get("HEAD_IMPL", "dense")
     sine_k = int(os.environ.get("SINE_K", 16))
@@ -291,6 +293,14 @@ def _csv_tokens(raw: str) -> set[str]:
 def shadow_scope_allows(role: str) -> bool:
     scope = _csv_tokens(os.environ.get("SHADOW_SCOPE", "embed,mlp,head"))
     return "all" in scope or role in scope
+
+
+def maybe_attach_shadow(module: nn.Module, role: str) -> nn.Module:
+    shadow_group_size = int(os.environ.get("SHADOW_GROUP_SIZE", 0))
+    if shadow_group_size > 1 and shadow_scope_allows(role) and hasattr(module, "weight"):
+        module.shadow = ShadowGroupCompressor(tuple(int(v) for v in module.weight.shape), shadow_group_size, float(os.environ.get("SHADOW_BYTES_PER_PARAM", 1.0)))
+        module.shadow.init_from_weight(get_shadow_target_tensor(module))
+    return module
 
 
 class ShadowGroupCompressor(nn.Module):
@@ -1157,14 +1167,22 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        self.impl = os.environ.get("ATTN_IMPL", "binary")
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.norm = nn.RMSNorm(dim)
-        self.q_proj = BinaryLinear(dim, dim, shadow_role="attn")
-        self.k_proj = BinaryLinear(dim, kv_dim, shadow_role="attn")
-        self.v_proj = BinaryLinear(dim, kv_dim, shadow_role="attn")
-        self.proj = BinaryWeightLinear(dim, dim, shadow_role="attn")
+        self.norm = nn.Identity() if self.impl == "dense" else nn.RMSNorm(dim)
+        if self.impl == "dense":
+            self.q_proj = maybe_attach_shadow(CastedLinear(dim, dim, bias=False), "attn")
+            self.k_proj = maybe_attach_shadow(CastedLinear(dim, kv_dim, bias=False), "attn")
+            self.v_proj = maybe_attach_shadow(CastedLinear(dim, kv_dim, bias=False), "attn")
+            self.proj = maybe_attach_shadow(CastedLinear(dim, dim, bias=False), "attn")
+            self.proj._zero_init = True
+        else:
+            self.q_proj = BinaryLinear(dim, dim, shadow_role="attn")
+            self.k_proj = BinaryLinear(dim, kv_dim, shadow_role="attn")
+            self.v_proj = BinaryLinear(dim, kv_dim, shadow_role="attn")
+            self.proj = BinaryWeightLinear(dim, dim, shadow_role="attn")
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.mode = os.environ.get("ATTENTION_MODE", "binary_relu2")
         self.margin = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
@@ -1174,7 +1192,12 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         h = self.norm(x)
-        q, k, v = [t.reshape(bsz, seqlen, nh, self.head_dim).transpose(1, 2) for t, nh in zip(binary_linear_group(h, self.q_proj, self.k_proj, self.v_proj), (self.num_heads, self.num_kv_heads, self.num_kv_heads), strict=True)]
+        qkv = (
+            [self.q_proj(h), self.k_proj(h), self.v_proj(h)]
+            if self.impl == "dense"
+            else binary_linear_group(h, self.q_proj, self.k_proj, self.v_proj)
+        )
+        q, k, v = [t.reshape(bsz, seqlen, nh, self.head_dim).transpose(1, 2) for t, nh in zip(qkv, (self.num_heads, self.num_kv_heads, self.num_kv_heads), strict=True)]
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         if self.mode == "flash":
             q = scale_head_axis(apply_rotary_emb(F.rms_norm(q, (q.size(-1),)), cos, sin), self.q_gain)
@@ -1210,14 +1233,24 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.norm = nn.RMSNorm(dim)
-        self.gate = BinaryLinear(dim, hidden, shadow_role="mlp")
-        self.up = BinaryLinear(dim, hidden, shadow_role="mlp")
-        self.mid_norm = nn.RMSNorm(hidden)
-        self.proj = BinaryWeightLinear(hidden, dim, shadow_role="mlp")
+        self.impl = os.environ.get("MLP_IMPL", "binary")
+        if self.impl == "dense":
+            self.norm = nn.Identity()
+            self.fc = maybe_attach_shadow(CastedLinear(dim, hidden, bias=False), "mlp")
+            self.proj = maybe_attach_shadow(CastedLinear(hidden, dim, bias=False), "mlp")
+            self.proj._zero_init = True
+        else:
+            self.norm = nn.RMSNorm(dim)
+            self.gate = BinaryLinear(dim, hidden, shadow_role="mlp")
+            self.up = BinaryLinear(dim, hidden, shadow_role="mlp")
+            self.mid_norm = nn.RMSNorm(hidden)
+            self.proj = BinaryWeightLinear(hidden, dim, shadow_role="mlp")
 
     def forward(self, x: Tensor) -> Tensor:
         h = self.norm(x)
+        if self.impl == "dense":
+            h = torch.relu(self.fc(h))
+            return self.proj(h.square())
         gate, up = binary_linear_group(h, self.gate, self.up)
         h = gate * up
         return self.proj(self.mid_norm(h))
@@ -1305,6 +1338,9 @@ class GPT(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.weight)
         refresh_group_shadows(self)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1534,7 +1570,10 @@ def main() -> None:
         compile_status = f"{compile_status} tweaks={','.join(compile_tweaks)}"
     log0(f"compile:{compile_status}")
     log0(f"attention_mode:{args.attention_mode}_gqa")
-    log0(f"linear_impl:{args.linear_impl} sine_k:{args.sine_k} sine_m:{args.sine_m} binary_optimizer:{args.binary_optimizer}")
+    log0(
+        f"linear_impl:{args.linear_impl} attn_impl:{args.attn_impl} mlp_impl:{args.mlp_impl} "
+        f"sine_k:{args.sine_k} sine_m:{args.sine_m} binary_optimizer:{args.binary_optimizer}"
+    )
     log0(f"embed_impl:{args.embed_impl} head_impl:{args.head_impl}")
     log0(
         f"size_gated_rank:{args.size_gated_rank} size_loss_weight:{args.size_loss_weight} "
