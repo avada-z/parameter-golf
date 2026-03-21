@@ -379,8 +379,8 @@ def load_state_dict_with_size_gates(module: nn.Module, state_dict: dict[str, Ten
         weight = shadow.reconstruct(dtype=get_shadow_target_tensor(submodule).dtype)
         threshold_name = shadow_threshold_name(submodule)
         if threshold_name is not None:
-            weight = weight + expanded[prefix + threshold_name].to(dtype=weight.dtype)
-        expanded[prefix + target_name] = weight
+            weight = weight + expanded[prefix + threshold_name].to(device=weight.device, dtype=weight.dtype)
+        expanded[prefix + target_name] = weight.detach().to("cpu").contiguous()
     module.load_state_dict(expanded, strict=strict)
 
 
