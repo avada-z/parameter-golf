@@ -475,6 +475,24 @@ def shadow_modules(module: nn.Module) -> list[nn.Module]:
     return cached
 
 
+def module_params(module: nn.Module) -> list[nn.Parameter]:
+    cached = getattr(module, "_params_cache", None)
+    if cached is None:
+        cached = [param for param in module.parameters() if param.requires_grad]
+        setattr(module, "_params_cache", cached)
+    return cached
+
+
+def zero_touch_params(module: nn.Module) -> Tensor:
+    params = module_params(module)
+    if not params:
+        return torch.zeros(())
+    touch = params[0].reshape(-1)[:1].sum() * 0.0
+    for param in params[1:]:
+        touch = touch + param.reshape(-1)[:1].sum() * 0.0
+    return touch
+
+
 def module_shadow_metrics(module: nn.Module, stride: int = 1, phase: int = 0) -> tuple[Tensor, Tensor, Tensor]:
     param = next(iter(module.parameters()), None)
     device = param.device if param is not None else torch.device("cpu")
@@ -1719,6 +1737,7 @@ def main() -> None:
         size_loss = torch.zeros((), device=device_for_aux)
         shadow_loss = torch.zeros((), device=device_for_aux)
         behavior_loss = torch.zeros((), device=device_for_aux)
+        touch_loss = zero_touch_params(base_model) if distributed and args.shadow_group_size > 1 else torch.zeros((), device=device_for_aux)
         if args.size_gated_rank > 0 and args.size_loss_weight > 0:
             size_mb = module_expected_size_bytes(base_model) / (1024.0 * 1024.0)
             size_loss = size_mb * args.size_loss_weight
@@ -1742,7 +1761,7 @@ def main() -> None:
             teacher_probs = F.softmax((teacher_logits.float() / temperature).reshape(-1, teacher_logits.size(-1)), dim=-1)
             student_log_probs = F.log_softmax((student_logits.float() / temperature).reshape(-1, student_logits.size(-1)), dim=-1)
             behavior_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature * temperature * args.shadow_behavior_weight)
-        aux = size_loss + shadow_loss + behavior_loss
+        aux = size_loss + shadow_loss + behavior_loss + touch_loss
         return size_loss, shadow_loss, behavior_loss, aux
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
@@ -1772,6 +1791,8 @@ def main() -> None:
                 warmup_x = x
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
+                if distributed and args.shadow_group_size > 1:
+                    warmup_loss = warmup_loss + zero_touch_params(base_model)
                 (warmup_loss * grad_scale).backward()
             _, _, _, warmup_aux = aux_losses(warmup_step, distill_input_ids=warmup_x)
             if warmup_aux.requires_grad:
@@ -1850,6 +1871,8 @@ def main() -> None:
             distill_x = x
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+            if distributed and args.shadow_group_size > 1:
+                loss = loss + zero_touch_params(base_model)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
