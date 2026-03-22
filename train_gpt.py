@@ -714,6 +714,9 @@ def unpack_binary_tensor(packed: Tensor, shape: tuple[int, ...], dtype: torch.dt
     return torch.from_numpy(signs.reshape(shape)).to(dtype=dtype).contiguous()
 
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+    if ".shadow." in name:
+        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
     if t.dtype in {torch.float32, torch.bfloat16}:
@@ -1945,6 +1948,29 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+    load_state_dict_with_size_gates(base_model, export_state, strict=True)
+    torch.cuda.synchronize()
+    t_export_eval = time.perf_counter()
+    export_val_loss, export_val_bpb = eval_val(
+        args,
+        model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        log0,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_export_roundtrip val_loss:{export_val_loss:.4f} val_bpb:{export_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_export_eval):.0f}ms"
+    )
+    log0(f"final_export_roundtrip_exact val_loss:{export_val_loss:.8f} val_bpb:{export_val_bpb:.8f}")
 
     quant_obj, quant_stats = quantize_state_dict_int8(export_state)
     quant_buf = io.BytesIO()
